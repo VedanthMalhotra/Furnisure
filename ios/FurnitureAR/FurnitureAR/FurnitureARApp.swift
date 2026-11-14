@@ -11,14 +11,16 @@ struct FurnitureARApp: App {
 /// Loads the assembly app from the server running on your Mac.
 /// The Gemini key stays on the Mac; the phone only talks to the server.
 struct ContentView: View {
-    @AppStorage("serverURL") private var serverURL = "http://192.168.1.190:8765"
+    // New key, so a saved address from home Wi-Fi does not override the new default
+    @AppStorage("serverAddress") private var serverURL = "http://Roshans-Macbook-Pro.local:8765"
     @State private var showSettings = false
     @State private var loadError: String?
     @State private var reloadToken = 0
+    @StateObject private var bridge = WebBridge()
 
     var body: some View {
         ZStack {
-            WebView(url: URL(string: serverURL), reloadToken: reloadToken, loadError: $loadError)
+            WebView(url: URL(string: serverURL), reloadToken: reloadToken, loadError: $loadError, bridge: bridge)
                 .ignoresSafeArea()
                 // Two-finger long press anywhere opens the server settings
                 .simultaneousGesture(LongPressGesture(minimumDuration: 1.2).onEnded { _ in showSettings = true }, including: .all)
@@ -40,6 +42,13 @@ struct ContentView: View {
                 .padding()
             }
         }
+        // "Scan my step" in the kit player opens the AR check (StepScanView.swift)
+        .fullScreenCover(item: $bridge.request) { request in
+            StepScanView(request: request, server: serverURL) { next in
+                bridge.request = nil
+                bridge.finish(next: next)
+            }
+        }
         .sheet(isPresented: $showSettings) {
             SettingsView(serverURL: $serverURL) {
                 loadError = nil
@@ -59,7 +68,7 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("http://192.168.1.190:8765", text: $draft)
+                    TextField("http://Roshans-Macbook-Pro.local:8765", text: $draft)
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -89,18 +98,22 @@ struct WebView: UIViewRepresentable {
     let url: URL?
     let reloadToken: Int
     @Binding var loadError: String?
+    let bridge: WebBridge
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
+        config.userContentController.add(bridge, name: "furnisure")
         let web = WKWebView(frame: .zero, configuration: config)
         web.navigationDelegate = context.coordinator
         web.scrollView.bounces = false
         web.scrollView.contentInsetAdjustmentBehavior = .never
         web.isInspectable = true
-        if let url { web.load(URLRequest(url: url)) }
+        bridge.webView = web
+        // A short timeout shows the error screen instead of a blank page when the server is unreachable
+        if let url { web.load(URLRequest(url: url, timeoutInterval: 10)) }
         context.coordinator.lastToken = reloadToken
         return web
     }
@@ -109,7 +122,7 @@ struct WebView: UIViewRepresentable {
         context.coordinator.parent = self
         if context.coordinator.lastToken != reloadToken, let url {
             context.coordinator.lastToken = reloadToken
-            web.load(URLRequest(url: url))
+            web.load(URLRequest(url: url, timeoutInterval: 10))
         }
     }
 
@@ -124,5 +137,23 @@ struct WebView: UIViewRepresentable {
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             parent.loadError = nil
         }
+    }
+}
+
+/// Messages between the web page and the app. The kit player posts `scanStep` to
+/// `window.webkit.messageHandlers.furnisure`; the app answers through `window.furnisureScanDone`.
+final class WebBridge: NSObject, ObservableObject, WKScriptMessageHandler {
+    @Published var request: ScanRequest?
+    weak var webView: WKWebView?
+
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard let body = message.body as? [String: Any], body["type"] as? String == "scanStep",
+              let data = try? JSONSerialization.data(withJSONObject: body),
+              let request = try? JSONDecoder().decode(ScanRequest.self, from: data) else { return }
+        self.request = request
+    }
+
+    func finish(next: Bool) {
+        webView?.evaluateJavaScript("window.furnisureScanDone && window.furnisureScanDone({next: \(next)})")
     }
 }

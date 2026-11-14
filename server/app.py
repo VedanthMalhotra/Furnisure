@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles  # noqa: E402
 import pipeline  # noqa: E402
 from providers import make_provider  # noqa: E402
 from kits import router as kits_router  # noqa: E402
+from stepcheck import router as stepcheck_router  # noqa: E402
 
 JOBS_DIR = ROOT / "server" / "jobs"
 CACHE_DIR = JOBS_DIR / "cache"
@@ -155,8 +156,16 @@ def list_assets():
 
 
 app.include_router(kits_router)
+app.include_router(stepcheck_router)
 app.mount("/", StaticFiles(directory=ROOT / "web", html=True), name="web")
 
 if __name__ == "__main__":
+    import socket
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8765")))
+    # One socket for IPv6 and IPv4 alike, so a phone can connect over home Wi-Fi or an IPv6-only
+    # iPhone hotspot. uvicorn's own "::" binding is IPv6-only, so the socket is made here.
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    sock.bind(("::", int(os.environ.get("PORT", "8765"))))
+    uvicorn.Server(uvicorn.Config(app)).run(sockets=[sock])

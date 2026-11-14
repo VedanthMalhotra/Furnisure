@@ -7,3 +7,5 @@ pydantic
 pillow
 pypdfium2
 google-genai
+numpy
+scipy

@@ -25,6 +25,7 @@ let catalog, kit, model, parts, prediction, actions = [], step = 0, started = 0;
 let busy = false, playing = false, recording = false, recordFrame, travel, sourceUrl, referenceSource = false;
 const interval = 1700;
 let extras = [];                         // ids of hardware drawn in because the model leaves it out
+let hardwareSpecs = {};                  // id -> {kind, ...} for that drawn hardware
 const hardwareMeshes = new Map();        // IKEA part number -> real hardware mesh from the server
 const HARDWARE_LOOK = {
   screw: {color:0x9aa3ab,metalness:.8,roughness:.35},
@@ -79,6 +80,7 @@ function clearHardware() {
 // a faint blue glow, since their positions are estimates.
 async function addHardware(specs) {
   clearHardware();
+  hardwareSpecs = specs ?? {};
   for (const [id,spec] of Object.entries(specs ?? {})) {
     const {geometry,length,width} = spec.number
       ? await libraryGeometry(spec.number).catch(() => profileGeometry(spec.kind))
@@ -128,6 +130,8 @@ function updateControls() {
   $('next').disabled = locked || !actions.length || step === actions.length-1;
   $('play').disabled = $('review').disabled = locked || !actions.length;
   $('export').disabled = locked || !actions.length || !$('review').checked;
+  $('check-step').hidden = !scanBridge() || !actions[step]?.nodes?.length;
+  $('check-step').disabled = locked;
   $('play').textContent = playing ? 'Pause' : 'Play all';
 }
 
@@ -473,6 +477,48 @@ $('use-pa').onchange = () => {
     : 'Playback uses the original IKEA positions.');
 };
 $('review').onchange = updateControls;
+
+// ===================== Scan my step (iPhone app with LiDAR) =====================
+// The app opens an AR camera, lets the person line a ghost of this step up with their furniture,
+// scans it, and has the server compare it with the model (server/stepcheck.py).
+const scanBridge = () => window.webkit?.messageHandlers?.furnisure;
+
+function stepGroup(index) {
+  const number = actions[index]?.step;
+  const first = actions.findIndex(item => item.step === number);
+  let last = first;
+  while (last+1 < actions.length && actions[last+1].step === number) last++;
+  return {number,first,last};
+}
+
+$('check-step').onclick = () => {
+  const {number,first,last} = stepGroup(step);
+  const ids = list => [...new Set(list.flatMap(item => item.nodes))];
+  const installed = ids(actions.slice(0,first)).filter(id => typeof id === 'number');
+  const active = ids(actions.slice(first,last+1)).filter(id => typeof id === 'number' && !installed.includes(id));
+  const placed = new Set([...installed,...active]);
+  const future = [...parts.keys()].filter(id => typeof id === 'number' && !placed.has(id));
+  const hardware = {};
+  for (const id of ids(actions.slice(first,last+1))) {
+    const kind = hardwareSpecs[id]?.kind;
+    if (kind) hardware[kind] = (hardware[kind] ?? 0) + 1;
+  }
+  scanBridge().postMessage({
+    type:'scanStep', kit:kit.article_number, name:kit.name, step:String(number),
+    stepIndex:first, lastIndex:last, isLast:last === actions.length-1,
+    captions:[...new Set(actions.slice(first,last+1).map(item => item.caption))],
+    installed, active, future,
+    hardware:Object.entries(hardware).map(([name,count]) => ({name,count}))
+  });
+};
+
+// Called by the app when the person closes the scan: move on, or stay to fix and rescan
+window.furnisureScanDone = ({next} = {}) => {
+  if (!next) return;
+  const {last} = stepGroup(step);
+  playing = false;
+  showStep(Math.min(last+1,actions.length-1));
+};
 $('prev').onclick = () => { playing = false; showStep(step-1); };
 $('next').onclick = () => { playing = false; showStep(step+1); };
 $('play').onclick = () => { playing = !playing; if (playing) showStep(step === actions.length-1 ? 0 : step); updateControls(); };
