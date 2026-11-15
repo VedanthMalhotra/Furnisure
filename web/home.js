@@ -50,11 +50,16 @@ function render() {
     && (!query || `${k.title} ${k.type} ${k.source}`.toLowerCase().includes(query)));
   $('kitGrid').innerHTML = shown.length ? shown.map(k => `
     <a class="kit" href="/kits.html?kit=${encodeURIComponent(k.article_number)}">
-      <span class="art" aria-hidden="true"><svg viewBox="0 0 24 24">${ICONS[k.type]}</svg></span>
+      <span class="art" aria-hidden="true"><img src="/thumbs/${encodeURIComponent(k.article_number)}.webp" alt="" loading="lazy" data-type="${k.type}"></span>
       <b>${esc(k.title)}</b>
       <span class="meta"><span>${k.mesh_nodes} parts</span><span class="src">${esc(k.source)}</span></span>
     </a>`).join('') : '<div class="empty">No furniture matches that search.</div>';
 }
+// A kit without a drawn picture (web/thumbs, made by server/tools/make_thumbs.py) falls back to its type icon
+$('kitGrid').addEventListener('error', event => {
+  const img = event.target;
+  if (img.tagName === 'IMG') img.outerHTML = `<svg viewBox="0 0 24 24">${ICONS[img.dataset.type] ?? ''}</svg>`;
+}, true);
 
 fetch('/api/kits').then(r => r.json()).then(list => {
   kits = list.map(k => ({ ...k, ...describe(k) }))

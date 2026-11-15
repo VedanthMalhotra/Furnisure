@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
 import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+import {makeAllenKey, keySize} from './allenkey.js';
 
 const $ = id => document.getElementById(id);
 const camera = new THREE.PerspectiveCamera(40,1,.001,100);
@@ -22,7 +23,7 @@ controls.addEventListener('start',() => { glide = undefined; });   // the user's
 const loader = new GLTFLoader();
 const assemblyCenter = new THREE.Vector3();
 let catalog, kit, model, parts, prediction, actions = [], step = 0, started = 0;
-let busy = false, playing = false, recording = false, recordFrame, travel, sourceUrl, referenceSource = false;
+let busy = false, playing = false, recording = false, recordFrame, travel, sourceUrl;
 const interval = 1700;
 let extras = [];                         // ids of hardware drawn in because the model leaves it out
 let hardwareSpecs = {};                  // id -> {kind, ...} for that drawn hardware
@@ -84,6 +85,32 @@ function spin(part, angle) {
 }
 
 function status(message) { $('status').textContent = message; }
+
+// An allen key on every screw that is being turned. `driven` lists them for this frame:
+// { part, from (the way the screw came in, or null), angle (how far it has turned) }.
+const keys = [], Z = new THREE.Vector3(0,0,1);
+function driveKeys(driven, progress, settle) {
+  driven.forEach(({part,from,angle}, i) => {
+    if (!keys[i]) views[0].scene.add(keys[i] = makeAllenKey());
+    const key = keys[i], {object} = part;
+    object.updateWorldMatrix(true,true);
+    const box = new THREE.Box3().setFromObject(object), centre = box.getCenter(new THREE.Vector3());
+    const axis = part.localAxis.clone().applyQuaternion(object.getWorldQuaternion(new THREE.Quaternion())).normalize();
+    // the head is at the end the screw came in from; without a path, the end facing away from the product
+    const outward = from && from.lengthSq() > 1e-12 ? from : centre.clone().sub(assemblyCenter);
+    const side = axis.dot(outward) < 0 ? -1 : 1, dir = axis.clone().multiplyScalar(side);
+    const size = box.getSize(new THREE.Vector3());
+    const length = Math.abs(dir.x)*size.x + Math.abs(dir.y)*size.y + Math.abs(dir.z)*size.z;
+    const width = Math.max(size.x*(1-Math.abs(dir.x)),size.y*(1-Math.abs(dir.y)),size.z*(1-Math.abs(dir.z)));
+    const scale = keySize(length,width);
+    key.scale.setScalar(scale);
+    key.position.copy(centre).addScaledVector(dir,length/2 + scale*(.6*settle-.08));   // lifts off once the screw is in
+    key.quaternion.setFromUnitVectors(Z,dir).multiply(new THREE.Quaternion().setFromAxisAngle(Z,angle*side));
+    key.userData.material.opacity = Math.min(1,progress*6)*(1-settle);
+    key.visible = key.userData.material.opacity > .01;
+  });
+  for (let i = driven.length; i < keys.length; i++) keys[i].visible = false;
+}
 
 // Hardware drawn from a profile when no real IKEA model fits: the same shapes as templates.js,
 // in millimetres, tip at the origin, +Z toward the head.
@@ -199,6 +226,24 @@ function focusOn(action) {
   if (to.distanceTo(controls.target) > 1e-6) glide = {t:0,from:controls.target.clone(),to};
 }
 
+// The manual page for a step, drawn by the server from the kit's manual. If the server cannot draw
+// it, the PDF itself is shown instead, in a fresh frame each time: changing only the #page part of
+// a PDF's address does not make the viewer turn the page.
+function showPage(page) {
+  const image = $('page-image');
+  image.hidden = false;
+  $('page').hidden = true;
+  image.onerror = () => {
+    if (!sourceUrl) return;
+    const frame = $('page').cloneNode();
+    frame.hidden = false;
+    frame.src = sourceUrl + '#page=' + page;
+    $('page').replaceWith(frame);
+    image.hidden = true;
+  };
+  image.src = '/api/kits/' + encodeURIComponent(kit.article_number) + '/pages/' + page;
+}
+
 function showStep(index) {
   step = index;
   started = performance.now();
@@ -206,15 +251,7 @@ function showStep(index) {
   $('step').textContent = action ? 'Step ' + action.step + ' · ' + action.caption : 'Finished IKEA model';
   if (parts) focusOn(action);
   $('source').hidden = !action;
-  if (action) {
-    $('page-image').hidden = !referenceSource;
-    $('page').hidden = referenceSource;
-    if (referenceSource) $('page-image').src = '/api/kits/' + encodeURIComponent(kit.article_number) + '/pages/' + action.page;
-    else {
-      const url = sourceUrl + '#page=' + action.page;
-      if ($('page').src !== url) $('page').src = url;
-    }
-  }
+  if (action) showPage(action.page);
   if (prediction) {
     const predicted = prediction.steps.find(item => item.step === action?.step);
     const expected = new Set(actions.filter(item => item.step === action?.step).flatMap(item => item.nodes));
@@ -381,6 +418,7 @@ function tick(now) {
       if (earlierSteps.has(item.step)) for (const pose of item.poses) playback.set(pose.node,pose);
     }
   }
+  const driven = [];                     // screws being turned in this frame, for the allen keys
   for (const [id,part] of parts) {
     const {object,position,rotation,localAxis,slender,length,centered} = part;
     object.visible = !action || previous.has(id) || active.has(id);
@@ -399,6 +437,8 @@ function tick(now) {
       object.position.copy(object.parent.worldToLocal(world));
       if (active.has(id) && move?.turns) {
         spin(part,(progress-1)*Math.PI*2*move.turns);
+        if (slender) driven.push({part,angle:(progress-1)*Math.PI*2*move.turns,
+          from:new THREE.Vector3(...(move.path?.[0] ?? move.start)).sub(new THREE.Vector3(...(move.path?.at(-1) ?? move.end)))});
       }
     } else if (active.has(id) && action.entry_target !== undefined) {
       const target = parts.get(action.entry_target).worldPosition;
@@ -407,6 +447,7 @@ function tick(now) {
         const shaft = localAxis.clone().applyQuaternion(object.getWorldQuaternion(new THREE.Quaternion()));
         direction.copy(shaft.multiplyScalar(direction.dot(shaft) < 0 ? -1 : 1));
         spin(part,(progress-1)*Math.PI*3);
+        driven.push({part,from:direction.clone(),angle:(progress-1)*Math.PI*3});
       }
       const distance = THREE.MathUtils.lerp(action.distance,action.seat_offset ?? 0,progress);
       const position = object.getWorldPosition(new THREE.Vector3()).addScaledVector(direction.normalize(),distance);
@@ -430,10 +471,12 @@ function tick(now) {
     }
     if (active.has(id) && action.motion === 'tighten' && isFastener && action.entry_target === undefined && !keyed) {
       spin(part,(progress-1)*Math.PI*2);
+      driven.push({part,from:null,angle:(progress-1)*Math.PI*2});
     }
   }
   // Glow on the parts being fitted, fading out once they are seated
   const settle = Math.min(1,Math.max(0,(now-started-span*.75)/350));
+  driveKeys(driven,progress,settle);
   for (const [id,part] of parts) {
     const k = action && active.has(id) ? 0.32*(1-settle) : 0;
     for (const material of part.materials) material.emissive.copy(material.userData.baseEmissive).lerp(GLOW,k);
@@ -484,7 +527,6 @@ $('scan').onsubmit = event => {
     await addHardware(result.plan.hardware);
     if (sourceUrl) URL.revokeObjectURL(sourceUrl);
     sourceUrl = URL.createObjectURL(file);
-    referenceSource = false;
     actions = result.plan.actions;
     $('review').checked = false;
     $('issues').textContent = result.plan.unresolved.join('\n');
@@ -652,7 +694,6 @@ perform(async () => {
       const manual = await fetch('/api/kits/' + encodeURIComponent(selected.article_number) + '/manual');
       if (!manual.ok) throw new Error('Could not load the matching manual.');
       sourceUrl = URL.createObjectURL(await manual.blob());
-      referenceSource = true;
       $('issues').textContent = result.plan.unresolved.join('\n');
       $('issues').hidden = !result.plan.unresolved.length;
       showStep(0);

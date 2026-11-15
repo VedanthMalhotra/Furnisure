@@ -5,7 +5,8 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#f4f1ec">
-<title>Assembly scanner</title>
+<title>Furnisure</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23d9822b'/%3E%3Cpath d='M16 7 8 11.5v9L16 25l8-4.5v-9z M8 11.5 16 16l8-4.5 M16 16v9' fill='none' stroke='%23fff' stroke-width='2' stroke-linejoin='round' stroke-linecap='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="./ui.css">
 <style>
 html, body { overflow: hidden }
@@ -16,11 +17,12 @@ html, body { overflow: hidden }
 
 /* Scan screen */
 .topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 28px }
-.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 16px }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; letter-spacing: -.01em }
 .mark { width: 32px; height: 32px; border-radius: 9px; background: var(--accent); display: grid; place-items: center }
 .mark svg { width: 19px; height: 19px; fill: none; stroke: #fff; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round }
-.hero { display: grid; grid-template-columns: 1.05fr 1fr; gap: 28px; align-items: start }
-.hero h1 { font-size: clamp(26px, 4.4vw, 38px); line-height: 1.12; letter-spacing: -.02em; margin: 6px 0 12px }
+.hero { display: grid; grid-template-columns: 1.05fr 1fr; gap: 36px; align-items: center }
+.hero h1 { font-size: clamp(28px, 4.6vw, 42px); line-height: 1.1; letter-spacing: -.025em; margin: 8px 0 14px; text-wrap: balance }
+.hero h1 em { font-style: normal; color: var(--accent-strong) }
 .lead { color: var(--muted); font-size: 16px; margin: 0 0 22px; max-width: 30em }
 .how { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px }
 .how li { display: grid; grid-template-columns: 34px 1fr; gap: 12px; align-items: start }
@@ -58,16 +60,19 @@ html, body { overflow: hidden }
 .filters button { height: 32px; padding: 0 12px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface);
   font-size: 13px; color: var(--muted); cursor: pointer }
 .filters button[aria-pressed=true] { background: var(--text); border-color: var(--text); color: #fff }
-.kits { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 10px }
+.kits { display: grid; grid-template-columns: repeat(auto-fill, minmax(176px, 1fr)); gap: 12px }
 .kit { display: flex; flex-direction: column; gap: 10px; padding: 12px; border-radius: 14px; background: var(--surface);
   border: 1px solid var(--border); text-decoration: none; color: var(--text); transition: border-color .15s, transform .15s, box-shadow .15s }
 .kit:hover { border-color: #e8c9a3; box-shadow: var(--shadow); transform: translateY(-1px) }
-.kit .art { height: 74px; border-radius: 10px; background: var(--sunken); display: grid; place-items: center; color: #b3a995 }
+.kit .art { height: 112px; border-radius: 10px; background: var(--sunken); display: grid; place-items: center; color: #b3a995; overflow: hidden }
+.kit .art img { width: 100%; height: 100%; object-fit: contain; padding: 6px; transition: transform .2s }
+.kit:hover .art img { transform: scale(1.05) }
 .kit .art svg { width: 40px; height: 40px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round }
 .kit b { font-size: 14px; font-weight: 600; line-height: 1.25 }
 .kit .meta { display: flex; justify-content: space-between; gap: 6px; font-size: 12px; color: var(--muted) }
 .kit .src { color: var(--faint) }
 .empty { color: var(--muted); font-size: 14px; padding: 18px 0 }
+.foot { margin-top: 36px; padding-top: 16px; border-top: 1px solid var(--border); color: var(--faint); font-size: 12px }
 
 /* Progress screen */
 .progress-wrap { max-width: 560px; margin: 0 auto; padding: calc(var(--top) + 48px) 16px 40px }
@@ -118,15 +123,15 @@ html, body { overflow: hidden }
 <section class="screen on" id="scan">
   <div class="page"><div class="wrap">
     <header class="topbar">
-      <div class="brand"><span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9z"/><path d="M4 7.5 12 12l8-4.5M12 12v9"/></svg></span>Assembly</div>
+      <div class="brand"><span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9z"/><path d="M4 7.5 12 12l8-4.5M12 12v9"/></svg></span>Furnisure</div>
       <span class="status-pill" id="health">Connecting…</span>
     </header>
 
     <div class="hero">
       <div>
         <div class="eyebrow">Flat-pack manual → 3D walkthrough</div>
-        <h1>See every step before you pick up a screwdriver.</h1>
-        <p class="lead">Scan a furniture manual and watch each step play out in 3D, with the matching page from the manual beside it.</p>
+        <h1>See every step <em>before</em> you pick up a screwdriver.</h1>
+        <p class="lead">Furnisure turns a flat-pack manual into a 3D walkthrough. Scan it, then watch each step play out with the matching page beside it.</p>
         <ol class="how">
           <li><span class="n">1</span><div><b>Scan</b><span>Upload the PDF or photograph each page.</span></div></li>
           <li><span class="n">2</span><div><b>Read</b><span>The model finds the parts and steps.</span></div></li>
@@ -157,6 +162,7 @@ html, body { overflow: hidden }
     </div>
     <div class="filters" id="kitFilters" role="group" aria-label="Filter by type"></div>
     <div class="kits" id="kitGrid"><div class="empty">Loading…</div></div>
+    <footer class="foot">Kit models and manuals come from the IKEA 3D Assembly Dataset and the IKEA-Manual dataset, used for research. Furnisure is not affiliated with IKEA.</footer>
   </div></div>
 </section>
 

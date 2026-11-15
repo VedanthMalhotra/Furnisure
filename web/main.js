@@ -6,6 +6,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { toCreasedNormals } from 'three/addons/utils/BufferGeometryUtils.js';
 import { resolvePlan } from './resolver.js';
 import { solve, solveLayout } from './solver.js';
+import { makeAllenKey, keySize } from './allenkey.js';
 
 const $ = id => document.getElementById(id);
 const show = id => document.querySelectorAll('.screen').forEach(s => s.classList.toggle('on', s.id === id));
@@ -272,6 +273,7 @@ function buildTimeline(solved, parts) {
       const mv = { ...m, t0, t1: t0 + travel, A: m.from && decompose(m.from), S: decompose(m.start), F: decompose(m.final),
         marker: m.marker ? makeMarker(m.target) : null };
       mv.ghost = makeGhost(parts[m.key.split('#')[0]], m.final);
+      if (m.fit === 'screw' && !m.from) mv.tool = makeTool(parts[m.key.split('#')[0]]);
       mv.path = makePath([mv.A?.p, mv.S.p, mv.F.p].filter(Boolean));
       return mv;
     });
@@ -279,6 +281,17 @@ function buildTimeline(solved, parts) {
     return { info, step: info.step, shownBefore, placed, moves, groundBefore, lifted, groundAfter, intro,
       down: tEnd + 0.15, dur: tEnd + 1.2 };
   });
+}
+
+// An allen key for a screw: it sits in the head and turns with it. Hardware is drawn tip at the
+// origin with the head toward +Y, so the head's height and width come straight from its box.
+function makeTool(part) {
+  const tool = makeAllenKey();
+  tool.userData.top = part.box.max.y;
+  tool.userData.size = keySize(part.box.max.y - part.box.min.y, part.box.max.x - part.box.min.x);
+  tool.scale.setScalar(tool.userData.size);
+  rig.add(tool);
+  return tool;
 }
 
 // Faint copy of a part at the place it is about to go
@@ -320,6 +333,8 @@ function makeMarker(target) {
 let state = null, lineArt = false;
 const tmp = new THREE.Matrix4(), one = new THREE.Vector3(1, 1, 1), pos = new THREE.Vector3(), quat = new THREE.Quaternion();
 const spinQ = new THREE.Quaternion();
+const headUp = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 1, 0));
+const lift = new THREE.Vector3();
 
 function apply(s, t) {
   const { timeline, instances } = state;
@@ -328,6 +343,7 @@ function apply(s, t) {
   timeline.forEach(st => st.moves.forEach(m => {
     if (m.marker) m.marker.visible = false;
     m.ghost.visible = false;
+    if (m.tool) m.tool.visible = false;
     if (m.path) m.path.visible = false;
   }));
   const glow = (key, k) => { if (k > 0) for (const mesh of instances.get(key).group.children) mesh.userData.mat.emissiveIntensity = 0.3 * k; };
@@ -353,6 +369,13 @@ function apply(s, t) {
       if (m.fit === 'screw') quat.premultiply(spinQ.setFromAxisAngle(m.target.n, (1 - p) * Math.PI * 6));
     }
     showKey(m.key, tmp.compose(pos, quat, one));
+    if (m.tool) {   // rides on the screw head while it turns, then lifts away
+      const away = seg(t, m.t1 + 0.1, 0.45), shown = Math.min(seg(t, m.t0 - 0.2, 0.3), 1 - away);
+      m.tool.visible = shown > 0.01;
+      m.tool.userData.material.opacity = shown;
+      m.tool.quaternion.copy(quat).multiply(headUp);
+      m.tool.position.copy(pos).add(lift.set(0, m.tool.userData.top + m.tool.userData.size * (0.6 * away - 0.08), 0).applyQuaternion(quat));
+    }
     // glow from just before it moves until a moment after it is seated
     glow(m.key, Math.min(seg(t, m.t0 - 0.35, 0.35), 1 - seg(t, m.t1 + 0.25, 0.6)));
     // ghost at the destination fades in first, then fades as the part arrives
