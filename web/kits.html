@@ -3,25 +3,43 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#f5f7ef">
+<meta name="theme-color" content="#182e26">
 <title>Furnisure · Kits</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23496650'/%3E%3Cpath d='M16 7 8 11.5v9L16 25l8-4.5v-9z M8 11.5 16 16l8-4.5 M16 16v9' fill='none' stroke='%23fff' stroke-width='2' stroke-linejoin='round' stroke-linecap='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="./ui.css">
 <style>
-html, body { overflow: hidden }
-#left { position: absolute; inset: 0 }
+html, body { overflow: hidden; background: #182e26 }
+body { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: 10px; max-width: 1240px;
+  margin-inline: auto; padding: calc(var(--top) + 10px) 12px calc(var(--bottom) + 10px) }
+.player-header { position: relative; z-index: 1; color: #f5f8f0 }
+.player-nav { display: flex; align-items: center; gap: 10px }
+.player-nav .home-btn, .manual-menu summary { min-height: 44px; background: #294438; border: 1px solid #557164;
+  color: #f5f8f0; border-radius: 12px; white-space: nowrap }
+.player-nav .home-btn:hover, .manual-menu summary:hover { background: #375548 }
+.kit-name { flex: 1; min-width: 0; margin: 0; font-size: 13px; font-weight: 650; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; text-align: center }
+.manual-menu { position: relative }
+.manual-menu summary { padding: 0 12px; font-weight: 600 }
+.step-info { padding: 10px 2px 2px }
+.step-info .eyebrow { color: #c3d7ae }
+.step-title { margin: 1px 0 0; font-size: clamp(19px, 4.8vw, 26px); letter-spacing: -.025em }
+#status { margin: 4px 0 0; color: #d6e4d5 }
+#status:empty { display: none }
+#left { min-width: 0; min-height: 0; overflow: hidden; border-radius: 20px; background: var(--sunken) }
 #left canvas { display: block; width: 100%; height: 100%; touch-action: none }
-.player-card .step-title { margin-top: 0 }
-#issues { color: var(--bad); white-space: pre-line; font-size: 12px; background: var(--bad-soft); border-radius: 8px; padding: 6px 8px; margin: 8px 0 0 }
-.chooser { display: grid; gap: 10px; padding: 6px 0 4px }
-.chooser label { display: grid; gap: 4px; font-size: 12px; color: var(--muted) }
-.chooser select, .chooser input[type=file] { width: 100%; min-height: 38px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); font-size: 14px; color: var(--text) }
+.chooser { position: absolute; top: calc(100% + 8px); right: 0; width: min(320px, calc(100vw - 24px));
+  display: grid; gap: 12px; padding: 14px; background: var(--surface); color: var(--text) }
+.chooser label { display: grid; gap: 6px; font-size: 13px; font-weight: 600 }
+.chooser input[type=file] { width: 100%; min-height: 44px; padding: 8px; border: 1px solid var(--border);
+  border-radius: 10px; background: var(--surface-2); font-size: 14px }
 .chooser form { display: grid; gap: 8px }
-.chooser .row { display: flex; gap: 12px; flex-wrap: wrap; font-size: 13px }
+.chooser a { display: flex; align-items: center; min-height: 44px; font-size: 14px }
+.dock { position: static }
+.controls { border-radius: 18px; background: #fbfcf7; padding: 10px }
 .page-thumb.manual { height: min(46vh, 420px); display: flex }
 .page-thumb.manual img, .page-thumb.manual iframe { width: 100%; height: 100%; border: 0; border-radius: 8px; object-fit: contain; background: #fff }
-.controls .export { display: flex; align-items: center; gap: 8px; margin-left: auto }
-.controls .btn { min-height: 40px; padding: 0 14px; font-size: 14px }
+.controls #export { margin-left: auto }
+.controls .btn { min-height: 44px; padding: 0 12px; font-size: 14px }
 /* Rendered page images keep their own shape; only the PDF viewer needs a fixed height */
 .page-thumb.manual:has(> img:not([hidden])) { height: auto; width: min(440px, 42vw) }
 .page-thumb.manual img { height: auto; max-height: 46vh }
@@ -30,29 +48,36 @@ html, body { overflow: hidden }
   .page-thumb.manual { height: 28vh; width: 44vw }
   .page-thumb.manual:has(> img:not([hidden])) { width: 72vw }
   .page-thumb.manual img { max-height: 30vh }
-  .controls .export { margin-left: 0; flex-basis: 100%; justify-content: space-between }
+  .controls .group { flex-basis: 100%; display: grid; grid-template-columns: 48px minmax(0, 1fr) 48px }
+  .controls .icon-btn { width: 100% }
+  .controls #export { margin-left: 0; flex: 1 }
 }
 </style>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
 </head>
 <body>
-<div id="left"></div>
+<header class="player-header">
+  <nav class="player-nav" aria-label="Walkthrough">
+    <a class="icon-btn home-btn" href="/"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 10.5 12 4l9 6.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>Home</a>
+    <p id="kitName" class="kit-name"></p>
+    <details class="manual-menu"><summary>Manual</summary>
+      <div class="chooser glass">
+        <a id="manual" target="_blank" rel="noopener">Open manual PDF</a>
+        <form id="scan">
+          <label>Use a different manual <input id="pdf" type="file" accept="application/pdf" required></label>
+          <button class="btn secondary">Read manual</button>
+        </form>
+      </div>
+    </details>
+  </nav>
+  <div class="step-info">
+    <div id="stepLabel" class="eyebrow" hidden></div>
+    <h1 id="step" class="step-title">Finished model</h1>
+    <p id="status" class="muted" role="status">Loading model&hellip;</p>
+  </div>
+</header>
 
-<section class="player-card glass">
-  <p id="step" class="step-title">Finished model</p>
-  <p id="status" class="muted" role="status" style="margin:4px 0 0">Loading kits…</p>
-  <details><summary>Change furniture or manual</summary>
-    <p id="issues" hidden></p>
-    <div class="chooser">
-      <label>Furniture <select id="kit"></select></label>
-      <form id="scan">
-        <label>Read a manual with the model <input id="pdf" type="file" accept="application/pdf" required></label>
-        <button class="btn secondary">Read manual</button>
-      </form>
-      <div class="row"><a id="manual" target="_blank" rel="noopener">Open the manual PDF</a><a href="/">Scan a new manual</a></div>
-    </div>
-  </details>
-</section>
+<main id="left" aria-label="3D assembly"></main>
 
 <section id="comparison-panel"><div id="right" hidden></div><p id="comparison">No Manual-PA run available.</p>
 <p><label><input id="use-pa" type="checkbox" disabled> Use imported poses in playback and export</label></p>
@@ -64,17 +89,12 @@ html, body { overflow: hidden }
   <section class="page-thumb manual glass" id="source" hidden><img id="page-image" alt="Assembly manual page" hidden><iframe id="page" title="Source assembly manual"></iframe></section>
   <section class="controls glass">
     <div class="group">
-      <a class="icon-btn home-btn" href="/"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 10.5 12 4l9 6.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>Home</a>
-      <span class="sep"></span>
       <button class="icon-btn" id="prev" disabled aria-label="Previous step" title="Previous step"><svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg></button>
       <button class="pill-btn" id="play" disabled>Play all</button>
       <button class="icon-btn" id="next" disabled aria-label="Next step" title="Next step"><svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></button>
     </div>
     <button class="btn" id="check-step" hidden>Scan my step</button>
-    <div class="export">
-      <label class="chip"><input id="review" type="checkbox" disabled>Checked against the manual</label>
-      <button class="btn secondary" id="export" disabled>Export video</button>
-    </div>
+    <button class="btn secondary" id="export" disabled>Export video</button>
   </section>
 </div>
 <script type="module" src="./kits.js"></script>

@@ -4,7 +4,8 @@ import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
 import {makeAllenKey, keySize} from './allenkey.js';
 
 const $ = id => document.getElementById(id);
-const camera = new THREE.PerspectiveCamera(40,1,.001,100);
+const viewAngle = 40;
+const camera = new THREE.PerspectiveCamera(viewAngle,1,.001,100);
 const views = ['left','right'].map(id => {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0xe8ede2);
@@ -22,7 +23,7 @@ let glide;                                // camera move towards the parts of th
 controls.addEventListener('start',() => { glide = undefined; });   // the user's own orbit wins
 const loader = new GLTFLoader();
 const assemblyCenter = new THREE.Vector3();
-let catalog, kit, model, parts, prediction, actions = [], step = 0, started = 0;
+let kit, model, parts, prediction, actions = [], step = 0, started = 0;
 let busy = false, playing = false, recording = false, recordFrame, travel, sourceUrl;
 const interval = 1700;
 let extras = [];                         // ids of hardware drawn in because the model leaves it out
@@ -203,13 +204,12 @@ function alongPath(points, t) {
 
 function updateControls() {
   const locked = busy || recording;
-  for (const element of [$('kit'),$('pdf'),$('scan').querySelector('button')]) element.disabled = locked;
+  for (const element of [$('pdf'),$('scan').querySelector('button')]) element.disabled = locked;
   $('prediction').disabled = locked || !model;
   $('use-pa').disabled = locked || !prediction || !actions.length;
   $('prev').disabled = locked || !actions.length || step === 0;
   $('next').disabled = locked || !actions.length || step === actions.length-1;
-  $('play').disabled = $('review').disabled = locked || !actions.length;
-  $('export').disabled = locked || !actions.length || !$('review').checked;
+  $('play').disabled = $('export').disabled = locked || !actions.length;
   $('check-step').hidden = !scanBridge() || !actions[step]?.nodes?.length;
   $('check-step').disabled = locked;
   $('play').textContent = playing ? 'Pause' : 'Play all';
@@ -218,11 +218,16 @@ function updateControls() {
 // Centre the view between the whole product and the parts this step fits, so the move stays in frame
 function focusOn(action) {
   const box = new THREE.Box3();
-  for (const id of action?.nodes ?? []) {
+  const host = views[0].host;
+  const portrait = host.clientWidth < host.clientHeight;
+  const visibleNodes = portrait && action ? actions.slice(0, step + 1).flatMap(item => item.nodes) : action?.nodes ?? [];
+  for (const id of visibleNodes) {
     const part = parts.get(id);
-    if (part) box.expandByPoint(part.worldPosition);
+    if (part && portrait) box.union(part.worldBounds);
+    else if (part) box.expandByPoint(part.worldPosition);
   }
-  const to = box.isEmpty() ? assemblyCenter.clone() : box.getCenter(new THREE.Vector3()).lerp(assemblyCenter,.35);
+  const to = box.isEmpty() ? assemblyCenter.clone()
+    : box.getCenter(new THREE.Vector3()).lerp(assemblyCenter, portrait ? 0 : .35);
   if (to.distanceTo(controls.target) > 1e-6) glide = {t:0,from:controls.target.clone(),to};
 }
 
@@ -230,7 +235,9 @@ function showStep(index) {
   step = index;
   started = performance.now();
   const action = actions[index];
-  $('step').textContent = action ? 'Step ' + action.step + ' · ' + action.caption : 'Finished IKEA model';
+  $('stepLabel').textContent = action ? 'Step ' + action.step.replace(/^step\s+/i, '') : '';
+  $('stepLabel').hidden = !action;
+  $('step').textContent = action?.caption ?? 'Finished model';
   if (parts) focusOn(action);
   $('source').hidden = true;     // the manual page stays out of the way of the 3D model
   if (prediction) {
@@ -279,6 +286,7 @@ async function load(item) {
         object, position:object.position.clone(), rotation:object.quaternion.clone(),
         localAxis:axis, localCenter:bounds.getCenter(new THREE.Vector3()), slender:axes[0] > 2*axes[1], length:axes[0],
         centered:Math.abs(bounds.min.getComponent(longest)+bounds.max.getComponent(longest)) < axes[0]*.1,
+        worldBounds:bounds.clone().applyMatrix4(object.matrixWorld),
         worldPosition:object.getWorldPosition(new THREE.Vector3()),
         worldRotation:object.getWorldQuaternion(new THREE.Quaternion())
       });
@@ -321,12 +329,11 @@ async function load(item) {
   sourceUrl = undefined;
   prediction = undefined;
   views[0].scene.add(model);
-  $('right').hidden = $('issues').hidden = true;
-  $('review').checked = false;
+  $('right').hidden = true;
   $('prediction').value = '';
   $('use-pa').checked = false;
   $('comparison').textContent = 'No Manual-PA run available for this kit.';
-  $('kit').value = kit.article_number;
+  $('kitName').textContent = kit.name;
   $('manual').href = '/api/kits/' + kit.article_number + '/manual';
   const bounds = new THREE.Box3().setFromObject(model);
   const size = bounds.getSize(new THREE.Vector3()).length();
@@ -346,6 +353,8 @@ function draw(view) {
   const canvas = view.renderer.domElement;
   if (canvas.width !== width || canvas.height !== height) view.renderer.setSize(width,height,false);
   camera.aspect = width/height;
+  camera.fov = THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(viewAngle / 2))
+    * Math.max(1, 1 / camera.aspect)));
   camera.updateProjectionMatrix();
   view.renderer.render(view.scene,camera);
 }
@@ -504,16 +513,13 @@ async function readManual(pdf, fresh = false) {
   await load(result.kit);
   await addHardware(result.plan.hardware);
   setPlan(result.plan, pdf);
-  status(kit.name + ' · ' + kit.manual_id + ' · Review the parts and illustrative motion before export.');
+  status('');
 }
 
 function setPlan(plan, pdf) {
   if (sourceUrl) URL.revokeObjectURL(sourceUrl);
   sourceUrl = URL.createObjectURL(pdf);
   actions = plan.actions;
-  $('review').checked = false;
-  $('issues').textContent = plan.unresolved.join('\n');
-  $('issues').hidden = !plan.unresolved.length;
   showStep(0);
 }
 
@@ -522,10 +528,6 @@ $('scan').onsubmit = event => {
   const file = $('pdf').files[0];
   if (file) perform(() => readManual(file));
 };
-$('kit').onchange = () => perform(async () => {
-  await load(catalog.find(item => item.article_number === $('kit').value));
-  status('Kit loaded. Upload the matching PDF to generate steps.');
-});
 $('prediction').onchange = async () => {
   try {
     const result = JSON.parse(await $('prediction').files[0].text());
@@ -550,20 +552,17 @@ $('prediction').onchange = async () => {
     }
     prediction = result;
     $('use-pa').checked = false;
-    $('review').checked = false;
     $('right').hidden = false;
     showStep(step);
     if (!actions.length) $('comparison').textContent = 'Prediction loaded. Read the manual to synchronize steps.';
   } catch (error) { $('comparison').textContent = error.message; }
 };
 $('use-pa').onchange = () => {
-  $('review').checked = false;
   showStep(step);
   status($('use-pa').checked
-    ? 'Playback uses imported positions where available. Remaining parts use IKEA positions. Review before export.'
+    ? 'Playback uses imported positions where available. Remaining parts use IKEA positions.'
     : 'Playback uses the original IKEA positions.');
 };
-$('review').onchange = updateControls;
 
 // ===================== Scan my step (iPhone app with LiDAR) =====================
 // The app opens an AR camera, lets the person line a ghost of this step up with their furniture,
@@ -654,7 +653,7 @@ $('export').onclick = () => {
       context.drawImage(frame,(1280-width)/2,(610-height)/2,width,height);
       context.fillStyle = '#fff';
       context.font = '24px system-ui';
-      context.fillText($('step').textContent,32,650,1216);
+      context.fillText($('stepLabel').textContent + ' · ' + $('step').textContent,32,650,1216);
       context.font = '17px system-ui';
       context.fillText(($('use-pa').checked ? 'Imported poses where available · ' : '') + 'IKEA 3D Assembly Dataset · Inter IKEA Systems B.V. · CC BY-NC-SA 4.0',32,687);
       if (!playing && recorder.state === 'recording') recorder.stop();
@@ -667,8 +666,7 @@ $('export').onclick = () => {
 perform(async () => {
   const response = await fetch('/api/kits');
   if (!response.ok) throw new Error('Could not load the kit catalog.');
-  catalog = await response.json();
-  for (const item of catalog) $('kit').add(new Option(item.name+' · '+item.article_number,item.article_number));
+  const catalog = await response.json();
   const params = new URLSearchParams(location.search);
   const requested = params.get('kit');
   const selected = catalog.find(item => item.article_number === requested);
@@ -693,9 +691,7 @@ perform(async () => {
       }
       const result = await reference.json();
       setPlan(result.plan, pdf);
-      if (selected.checked_plan && auto) status('Saved BEKVÄM steps with motion computed from the 3D model.');
-      else if (selected.checked_plan) status('Saved BEKVÄM walkthrough with individual rail, dowel, and screw actions.');
-      else status('Using dataset assembly annotations. Step numbers are dataset stages; compare the displayed manual. Motion is illustrative.');
+      status('');
     } else {
       status('Model loaded. Upload the matching PDF to generate steps with Gemini.');
     }

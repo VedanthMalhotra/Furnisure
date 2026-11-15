@@ -29,7 +29,6 @@ $('files').onchange = () => {
 };
 $('go').onclick = async () => {
   const files = [...$('files').files];
-  const fresh = $('fresh').checked;
   $('scanErr').textContent = '';
   if (files.length === 1) {
     const match = new FormData();
@@ -40,7 +39,6 @@ $('go').onclick = async () => {
       const result = await response.json();
       if (result.article_number) {
         const params = new URLSearchParams({ kit: result.article_number, read: '1' });
-        if (fresh) params.set('fresh', '1');
         location.href = `/kits.html?${params}`;
         return;
       }
@@ -48,7 +46,7 @@ $('go').onclick = async () => {
   }
   const fd = new FormData();
   for (const file of files) fd.append('files', file);
-  startJob(fetch(`/api/jobs?fresh=${fresh}`, { method: 'POST', body: fd }));
+  startJob(fetch('/api/jobs', { method: 'POST', body: fd }));
 };
 $('back1').onclick = () => { location.hash = ''; show('scan'); };
 

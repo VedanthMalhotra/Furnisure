@@ -16,36 +16,3 @@ drop.addEventListener('drop', event => {
   $('files').files = list.files;
   $('files').dispatchEvent(new Event('change'));
 });
-
-const preview = $('assemblyPreview');
-const toggle = $('previewToggle');
-const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
-let previewVisible = false;
-let userWantsPlayback;
-
-function updatePreview() {
-  const shouldPlay = userWantsPlayback ?? !reduceMotion.matches;
-  if (shouldPlay && previewVisible && !document.hidden) {
-    preview.play().catch(() => { /* The play button stays available if autoplay is blocked. */ });
-  } else {
-    preview.pause();
-  }
-}
-
-for (const [event, label] of [['play', 'Pause preview'], ['pause', 'Play preview']]) {
-  preview.addEventListener(event, () => { toggle.textContent = label; });
-}
-preview.addEventListener('error', () => { toggle.hidden = true; });
-toggle.addEventListener('click', () => {
-  userWantsPlayback = preview.paused;
-  if (userWantsPlayback) preview.play().catch(() => {});
-  else preview.pause();
-});
-
-const observer = new IntersectionObserver(([entry]) => {
-  previewVisible = entry.isIntersecting;
-  updatePreview();
-}, { threshold: 0.25 });
-observer.observe(preview);
-document.addEventListener('visibilitychange', updatePreview);
-reduceMotion.addEventListener('change', updatePreview);
