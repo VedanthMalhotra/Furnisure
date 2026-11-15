@@ -191,7 +191,7 @@ html, body { overflow: hidden }
     <div class="k" id="status" style="margin-top:6px"></div>
   </div>
   <div class="dock">
-    <div class="page-thumb glass" id="src"><canvas id="srcCanvas"></canvas><div class="muted" id="srcLabel"></div></div>
+    <div class="page-thumb glass" id="src" style="display:none"><canvas id="srcCanvas"></canvas><div class="muted" id="srcLabel"></div></div>
     <div class="controls glass">
       <div class="group">
         <button class="icon-btn" id="newScan" aria-label="New scan" title="New scan"><svg viewBox="0 0 24 24"><path d="M3 10.5 12 4l9 6.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg></button>
@@ -208,7 +208,7 @@ html, body { overflow: hidden }
       <div class="group">
         <label class="chip"><input type="checkbox" id="all" checked>Autoplay</label>
         <label class="chip"><input type="checkbox" id="lineart">Line art</label>
-        <label class="chip"><input type="checkbox" id="showsrc" checked>Page</label>
+        <label class="chip"><input type="checkbox" id="showsrc">Page</label>
       </div>
     </div>
   </div>

@@ -226,32 +226,13 @@ function focusOn(action) {
   if (to.distanceTo(controls.target) > 1e-6) glide = {t:0,from:controls.target.clone(),to};
 }
 
-// The manual page for a step, drawn by the server from the kit's manual. If the server cannot draw
-// it, the PDF itself is shown instead, in a fresh frame each time: changing only the #page part of
-// a PDF's address does not make the viewer turn the page.
-function showPage(page) {
-  const image = $('page-image');
-  image.hidden = false;
-  $('page').hidden = true;
-  image.onerror = () => {
-    if (!sourceUrl) return;
-    const frame = $('page').cloneNode();
-    frame.hidden = false;
-    frame.src = sourceUrl + '#page=' + page;
-    $('page').replaceWith(frame);
-    image.hidden = true;
-  };
-  image.src = '/api/kits/' + encodeURIComponent(kit.article_number) + '/pages/' + page;
-}
-
 function showStep(index) {
   step = index;
   started = performance.now();
   const action = actions[index];
   $('step').textContent = action ? 'Step ' + action.step + ' · ' + action.caption : 'Finished IKEA model';
   if (parts) focusOn(action);
-  $('source').hidden = !action;
-  if (action) showPage(action.page);
+  $('source').hidden = true;     // the manual page stays out of the way of the 3D model
   if (prediction) {
     const predicted = prediction.steps.find(item => item.step === action?.step);
     const expected = new Set(actions.filter(item => item.step === action?.step).flatMap(item => item.nodes));
