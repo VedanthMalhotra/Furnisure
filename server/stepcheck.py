@@ -15,6 +15,8 @@ to ARKit world metres and may include a scale, since the IKEA-Manual kits are no
 import base64
 import io
 import math
+import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from typing import Literal, Optional
 
@@ -29,12 +31,14 @@ from kits import ROOT, geometry, get_kit
 router = APIRouter(prefix="/api/stepcheck")
 
 SPACING = 0.006      # metres between surface samples on the model
-FLOOR = 0.015        # scanned points this close to the floor are floor, not furniture
+FLOOR = 0.012        # scanned points this close to the floor are floor, not furniture
+FLAT = 0.04          # a step whose parts stand lower than this is too flat for the scan
 TOLERANCE = 0.02     # a model sample counts as scanned when a scan point is this close (metres)
 CONTACT = 0.008      # model samples this close to another part are hidden in a joint
 DISTINCT = 0.03     # a part is judged by its surface at least this far from every other part
 EXTRA = 0.035       # scan points farther than this from every expected part are unexplained
 GHOST_TRIANGLES = 6000
+ADVICE_SECONDS = 50  # Gemini takes 4 to 40 s; the phone waits 90 s for the whole answer
 
 
 def metres_per_unit(kit):
@@ -155,15 +159,19 @@ def _icp(scan, target, unit, with_scale):
     tree = cKDTree(target)
     total = np.eye(4)
     moved = scan.copy()
-    gates = np.geomspace(0.10, 0.015, 30) / unit
+    gates = np.geomspace(0.25, 0.015, 36) / unit   # recovers a ghost placed up to ~25 cm off
     rmse, inliers = float("inf"), 0
+    size = 1.0
     for gate in list(gates) + [gates[-1]] * 10:
         d, idx = tree.query(moved, distance_upper_bound=gate)
         ok = np.isfinite(d)
         if ok.sum() < 30:
             break
         s, r, t = _umeyama(moved[ok], target[idx[ok]], with_scale)
-        s = float(np.clip(s, 0.97, 1.03))   # scale may only drift a little per round
+        # size may only drift a little per round, and at most halve or double overall
+        s = float(np.clip(s, 0.97, 1.03))
+        s = float(np.clip(size * s, 0.5, 2.0) / size)
+        size *= s
         step = np.eye(4)
         step[:3, :3] = s * r
         step[:3, 3] = t
@@ -219,10 +227,19 @@ def check(article: str, body: CheckIn) -> dict:
     spacing = SPACING / unit
     samples = {p: _samples(article, p, spacing) for p in solid}
 
-    # floor: the ghost stands on the floor, so its lowest point marks it in world space
+    # floor: the ghost stands on the floor, so its lowest point marks it roughly; the scan's own
+    # densest flat layer near there marks it exactly
     target = np.concatenate([samples[p] for p in solid])
     target_world = target @ ghost_m[:3, :3].T + ghost_m[:3, 3]
-    floor_y = float(target_world[:, 1].min())
+    floor_y = _floor(world, target_world)
+    height = float(target_world[:, 1].max() - target_world[:, 1].min())
+    if height < FLAT:
+        results = [{"id": p, "name": parts[p]["name"], "active": p in body.active, "status": "unsure", "coverage": None,
+                    "message": "Lies too flat on the floor for the 3D scan to tell apart; checked from the photo."}
+                   for p in expected]
+        return {"verdict": "unsure", "summary": "At this step everything lies nearly flat on the floor, so the 3D scan "
+                "can't check it. The photo check below is all there is for this step.",
+                "parts": results, "extras": [], "transform": body.ghost, "fit": {"height_m": round(height, 3)}}
     above = world[:, 1] > floor_y + FLOOR
     model_pts = world @ to_model[:3, :3].T + to_model[:3, 3]
 
@@ -237,8 +254,18 @@ def check(article: str, body: CheckIn) -> dict:
     if len(scan) > 60000:
         scan = scan[np.random.default_rng(0).choice(len(scan), 60000, replace=False)]
 
-    with_scale = metres_per_unit(kit) is None
-    icp, aligned, rmse, inliers = _icp(scan, target, unit, with_scale)
+    # The size is always fitted to the scan, so the model matches the furniture in front of the person
+    # even when it is a different size from the kit's model (or the model has no real size at all)
+    icp, aligned, rmse, inliers = _icp(scan, target, unit, with_scale=True)
+    if inliers < max(100, 0.25 * len(scan)) or not np.isfinite(rmse):
+        # the scan under the ghost does not look like this furniture at all
+        results = [{"id": p, "name": parts[p]["name"], "active": p in body.active, "status": "unsure", "coverage": None,
+                    "message": "Not checked: the scan could not be lined up with the model."} for p in expected]
+        return {"verdict": "unsure", "summary": "The scan doesn't match the shape of the furniture at this step, so the "
+                "parts couldn't be checked. Make sure the ghost sits right over your furniture (tip it over if it's "
+                "lying down), then scan again, walking all the way around.",
+                "parts": results, "extras": [], "transform": body.ghost,
+                "fit": {"points": int(len(scan)), "inliers": inliers}}
     scale = float(np.cbrt(abs(np.linalg.det(icp[:3, :3]))))
     unit_after = unit / scale          # metres per model unit after the fit
     transform = ghost_m @ np.linalg.inv(icp)
@@ -330,14 +357,35 @@ def check(article: str, body: CheckIn) -> dict:
 
     missing = [r for r in results if r["status"] == "missing"]
     verdict = "problems" if missing or extras else "unsure" if reference < 0.2 else "ok"
+    # how the real furniture compares with the kit model (only meaningful when the model has a real size)
+    known = metres_per_unit(kit)
+    resized = unit_after / known if known else None
     return {
         "verdict": verdict,
+        "missing": plain_list(r["name"] for r in missing),
+        "resized": round(resized, 3) if resized and abs(resized - 1) > 0.05 else None,
         "transform": transform.T.reshape(-1).tolist(),   # column-major, model units -> world metres
         "fit": {"rmse_mm": round(rmse * 1000, 1), "inliers": inliers, "points": int(len(scan)),
                 "scale": round(scale, 4), "coverage": round(reference, 3)},
         "parts": results,
         "extras": extras,
     }
+
+
+def _floor(world, ghost_world):
+    """Height of the floor in world metres: the lowest dense 5 mm layer of scan points just below
+    the ghost's underside, which is where the person placed it. Lowest, not densest, so that a big
+    flat board lying above the floor is never taken for it."""
+    rough = float(ghost_world[:, 1].min())
+    lo, hi = ghost_world[:, [0, 2]].min(0) - 0.5, ghost_world[:, [0, 2]].max(0) + 0.5
+    near = world[np.all((world[:, [0, 2]] > lo) & (world[:, [0, 2]] < hi), axis=1)]
+    ys = near[(near[:, 1] > rough - 0.08) & (near[:, 1] < rough + 0.03), 1]
+    if len(ys) < 200:
+        return rough
+    counts, edges = np.histogram(ys, bins=np.arange(rough - 0.08, rough + 0.0301, 0.005))
+    dense = np.flatnonzero(counts >= 0.3 * counts.max())
+    first = int(dense[0])
+    return float((edges[first] + edges[first + 1]) / 2)
 
 
 def _clusters(points, unit):
@@ -363,7 +411,28 @@ def _clusters(points, unit):
 
 # ---------- the photo ----------
 
+def plain_name(name: str) -> str:
+    """'TOP RAIL_72935' -> 'top rail'; 'part 05: horizontal rail/bar, 35% of ...' -> 'horizontal rail/bar'."""
+    import re
+    if ":" in name:
+        name = name.split(":", 1)[1].split(",")[0]
+    name = re.sub(r"[_\s]*\d{3,}(_\d+)?$", "", name)          # catalogue numbers
+    name = re.sub(r"([_\s]+\d+)+$", "", name)                  # copy numbers: Rod_2_2 -> Rod
+    name = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)            # BottomLeft -> Bottom Left
+    return re.sub(r"[_\s]+", " ", name).strip().lower() or "a part"
+
+
+def plain_list(names) -> list[str]:
+    """Plain names with repeats grouped: ['rod', 'rod', 'top rail'] -> ['2 x rod', 'top rail']."""
+    from collections import Counter
+    counts = Counter(plain_name(n) for n in names)
+    return [f"{n} x {name}" if n > 1 else name for name, n in counts.items()]
+
+
 class Advice(BaseModel):
+    missing: list[str] = Field(description="Every part that is missing or not attached yet at this step, each in 2 to 4 "
+                                           "simple words a person would use, e.g. 'back panel', 'front left leg', "
+                                           "'2 rods on the right'. Group identical ones. Empty if nothing is missing")
     screws: Literal["ok", "problem", "cant_tell"] = Field(description="Whether the screws, bolts and dowels of this step look right")
     summary: str = Field(description="One short sentence for the person assembling, plain words, no part numbers they cannot see")
     tips: list[str] = Field(description="Up to three short, concrete fixes, e.g. 'The right top panel isn't on yet.' Empty if all is well")
@@ -374,10 +443,14 @@ ADVICE_PROMPT = """This photo shows furniture part-way through assembly, right a
 Hardware used in this step: {hardware}
 A 3D scan already compared the big parts with the model:
 {parts}
-Look at the photo. Check the screws, bolts, dowels and other small hardware of this step: are they in, in the right
-holes, and screwed in as far as the step says? Also say if anything the scan flagged is clearly visible.
-Speak to the person building it, in plain words, like "the right top panel isn't on yet". Do not invent problems
-you cannot see; say you can't tell when the photo does not show it."""
+Look at the photo.
+1. List the parts that are missing or not attached yet at this step, in short simple words ("back panel",
+   "front left leg", "2 rods on the right"), not the codes above. Include the ones the scan marked missing unless
+   the photo clearly shows them in place, and any others you can see are missing.
+2. Check the screws, bolts, dowels and other small hardware of this step: are they in, in the right holes, and
+   screwed in as far as the step says?
+Speak to the person building it, in plain words, like "the right top panel isn't on yet". Keep everything short.
+Do not invent problems you cannot see; say you can't tell when the photo does not show it."""
 
 
 def advice(body: CheckIn, results: list[dict]) -> Optional[dict]:
@@ -388,14 +461,19 @@ def advice(body: CheckIn, results: list[dict]) -> Optional[dict]:
     from providers import make_provider
     image = ImageOps.exif_transpose(Image.open(io.BytesIO(base64.b64decode(body.photo)))).convert("RGB")
     image.thumbnail((1600, 1600))
-    lines = "\n".join(f"- {r['name']}: {r['status']}" + (" (fitted in this step)" if r.get("active") else "")
+    lines = "\n".join(f"- {r['name']} ({plain_name(r['name'])}): {r['status']}" + (" (fitted in this step)" if r.get("active") else "")
                       for r in results if r["status"] != "hardware") or "- (no large parts)"
     hardware = ", ".join(f"{h.count} x {h.name}" for h in body.hardware) or "none listed"
     prompt = ADVICE_PROMPT.format(captions="\n".join("- " + c for c in body.captions) or f"- Step {body.step}",
                                   hardware=hardware, parts=lines)
     try:
-        out = make_provider(fail_fast=True).generate([_png(image)], prompt, Advice, temperature=0.1)
-        return {"screws": out.screws, "summary": out.summary.strip(), "tips": [t.strip() for t in out.tips if t.strip()][:3]}
+        # A slow model must not hold up the scan result: give up on the photo after ADVICE_SECONDS
+        pool = ThreadPoolExecutor(max_workers=1)
+        job = pool.submit(make_provider(fail_fast=True).generate, [_png(image)], prompt, Advice, 0.1)
+        pool.shutdown(wait=False)
+        out = job.result(timeout=ADVICE_SECONDS)
+        return {"screws": out.screws, "summary": out.summary.strip(), "tips": [t.strip() for t in out.tips if t.strip()][:3],
+                "missing": [m.strip() for m in out.missing if m.strip()][:8]}
     except Exception as error:   # the scan result is still useful without the photo check
         return {"screws": "cant_tell", "summary": "The photo check is unavailable right now.",
                 "tips": [], "error": f"{type(error).__name__}: {str(error)[:200]}"}
@@ -403,8 +481,18 @@ def advice(body: CheckIn, results: list[dict]) -> Optional[dict]:
 
 @router.post("/{article}")
 def check_step(article: str, body: CheckIn):
+    started = time.time()
+    print(f"[stepcheck] {article} step {body.step}: {len(body.points) * 3 // 4 // 12} points, "
+          f"photo {'yes' if body.photo else 'no'}", flush=True)
     result = check(article, body)
+    print(f"[stepcheck] scan compared in {time.time() - started:.1f}s: {result['verdict']}, fit {result.get('fit')}", flush=True)
     result["advice"] = advice(body, result["parts"]) if result["parts"] else None
+    # Gemini's plain names win; the scan's own list stands when the photo check is unavailable
+    if result["advice"] and "missing" in result["advice"]:
+        result["missing"] = result["advice"]["missing"]
+    result.setdefault("missing", [])
+    print(f"[stepcheck] missing: {result['missing']}", flush=True)
+    print(f"[stepcheck] done in {time.time() - started:.1f}s", flush=True)
     if result["advice"] and result["advice"].get("screws") == "problem" and result["verdict"] == "ok":
         result["verdict"] = "problems"
     return result

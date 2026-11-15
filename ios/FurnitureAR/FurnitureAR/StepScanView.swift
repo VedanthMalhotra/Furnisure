@@ -86,6 +86,8 @@ struct StepScanView: View {
 
     private func resultCard(_ result: CheckResult) -> some View {
         let problems = result.parts.filter { $0.status == "missing" }
+        let resized = result.resized.map { $0 > 1 ? "Your furniture is \(Int(($0 - 1) * 100 + 0.5))% bigger than the model; the model was resized to fit."
+                                                  : "Your furniture is \(Int((1 - $0) * 100 + 0.5))% smaller than the model; the model was resized to fit." }
         let unsure = result.parts.filter { $0.status == "unsure" }
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -96,13 +98,19 @@ struct StepScanView: View {
                         result.verdict == "problems" ? "Something needs fixing" : "Couldn't check everything")
                     .font(.headline)
             }
+            if let missing = result.missing, !missing.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Missing").font(.subheadline.bold()).foregroundStyle(.red)
+                    ForEach(missing, id: \.self) { Text("• " + $0).font(.subheadline) }
+                }
+            }
             if let summary = result.summary { Text(summary).font(.subheadline) }
             if let advice = result.advice {
                 Text(advice.summary).font(.subheadline)
                 ForEach(advice.tips, id: \.self) { Text("• " + $0).font(.footnote) }
             }
-            ForEach(problems) { Text("• \($0.name): missing or not in place").font(.footnote).foregroundStyle(.red) }
             ForEach(Array(result.extras.enumerated()), id: \.offset) { Text("• " + $0.element.message).font(.footnote).foregroundStyle(.red) }
+            if let resized { Text(resized).font(.footnote).foregroundStyle(.secondary) }
             if !unsure.isEmpty {
                 Text("Not sure about: " + unsure.map(\.name).joined(separator: ", ")).font(.footnote).foregroundStyle(.secondary)
             }
@@ -168,6 +176,7 @@ final class StepScanModel: NSObject, ObservableObject {
     private var scanTask: Task<Void, Never>?
     private var result: CheckResult?
     private var tapInstalled = false
+    private var fitted: simd_float4x4?           // where the last scan placed the model (with its size)
 
     private static let tips: [simd_quatf] = [
         simd_quatf(angle: 0, axis: [1, 0, 0]),
@@ -261,13 +270,10 @@ final class StepScanModel: NSObject, ObservableObject {
         self.handle = handle
         tipIndex = 0
         settle()
-        var gestures: ARView.EntityGestures = [.translation, .rotation]
-        if ghost.metres_per_unit == nil { gestures.insert(.scale) }
+        let gestures: ARView.EntityGestures = [.translation, .rotation, .scale]   // pinch to match furniture of any size; the server fits the exact size
         arView.installGestures(gestures, for: handle)
         phase = .aligning
-        hint = ghost.metres_per_unit == nil
-            ? "Drag, twist and pinch the ghost until it sits over your furniture. Orange parts are this step's."
-            : "Drag and twist the ghost until it sits over your furniture. Orange parts are this step's."
+        hint = "Drag, twist and pinch the ghost until it sits over your furniture and is about its size. Orange parts are this step's."
     }
 
     /// Tips the ghost onto its next side, for steps built lying down.
@@ -329,36 +335,60 @@ final class StepScanModel: NSObject, ObservableObject {
     }
 
     private func finishScan() async {
-        guard let frame = arView.session.currentFrame else { fail("The camera stopped. Try again."); return }
+        guard let frame = arView.session.currentFrame, let handle else { fail("The camera stopped. Try again."); return }
         phase = .checking
-        hint = "Facing the furniture helps the screw check: hold still a moment."
+        hint = "Collecting the scan…"
+        let started = Date()
         let ghostMatrix = modelNode.transformMatrix(relativeTo: nil)
-        let points = Self.scannedPoints(frame: frame, near: modelNode, handle: handle)
-        let photo = Self.photo(frame: frame)
+        // Everything the background work needs, copied out of RealityKit and ARKit on the main thread
+        let bounds = modelNode.visualBounds(relativeTo: handle)
+        let toHandle = handle.transformMatrix(relativeTo: nil).inverse
+        let meshes = frame.anchors.compactMap { $0 as? ARMeshAnchor }
+        let pixels = frame.capturedImage
+        log("finish: \(meshes.count) mesh anchors, \(meshes.reduce(0) { $0 + $1.geometry.vertices.count }) vertices")
+        let (points, photo) = await Task.detached(priority: .userInitiated) {
+            (Self.scannedPoints(meshes: meshes, bounds: bounds, toHandle: toHandle), Self.photo(pixels))
+        }.value
+        log("collected \(points.count) points, photo \(photo?.count ?? 0) bytes in \(Self.seconds(since: started))")
+        guard points.count >= 100 else {
+            fail("The scan picked up almost nothing near the ghost (\(points.count) points). Line the ghost up with your furniture and walk all the way around it.")
+            return
+        }
+        hint = "Comparing your furniture with the model… up to a minute."
         do {
             let result = try await StepCheckAPI.check(server: server, request: request, ghost: ghostMatrix,
-                                                      points: points, photo: photo)
+                                                      points: points, photo: photo) { [weak self] status in
+                Task { @MainActor in self?.hint = status }
+            }
+            log("result \(result.verdict) after \(Self.seconds(since: started))")
             show(result, fallback: ghostMatrix)
         } catch {
+            log("check failed after \(Self.seconds(since: started)): \(error)")
             fail("The check failed: \(error.localizedDescription)")
         }
     }
 
+    private func log(_ message: String) { print("[StepScan] " + message) }
+    private static func seconds(since date: Date) -> String { String(format: "%.1f s", Date().timeIntervalSince(date)) }
+
     /// The LiDAR mesh vertices near the ghost, in world metres, thinned to one per centimetre.
-    private static func scannedPoints(frame: ARFrame, near model: Entity, handle: Entity?) -> [SIMD3<Float>] {
-        guard let handle else { return [] }
-        let bounds = model.visualBounds(relativeTo: handle)
+    nonisolated private static func scannedPoints(meshes: [ARMeshAnchor], bounds: BoundingBox,
+                                                  toHandle: simd_float4x4) -> [SIMD3<Float>] {
         let pad: Float = 0.3
         let lo = bounds.min - SIMD3(pad, 0.05, pad), hi = bounds.max + SIMD3(pad, pad, pad)
-        let toHandle = handle.transformMatrix(relativeTo: nil).inverse
         var seen = Set<SIMD3<Int32>>()
         var points = [SIMD3<Float>]()
-        for case let mesh as ARMeshAnchor in frame.anchors {
+        for mesh in meshes {
             let vertices = mesh.geometry.vertices
-            let base = vertices.buffer.contents()
+            let base = UnsafeRawPointer(vertices.buffer.contents())
+            let toWorld = mesh.transform
             for i in 0..<vertices.count {
-                let v = base.advanced(by: vertices.offset + vertices.stride * i).assumingMemoryBound(to: SIMD3<Float>.self).pointee
-                let world = mesh.transform * SIMD4(v, 1)
+                // vertices are packed 12-byte float triples: read each float, never a 16-byte SIMD3
+                let at = vertices.offset + vertices.stride * i
+                let v = SIMD4<Float>(base.load(fromByteOffset: at, as: Float.self),
+                                     base.load(fromByteOffset: at + 4, as: Float.self),
+                                     base.load(fromByteOffset: at + 8, as: Float.self), 1)
+                let world = toWorld * v
                 let local = toHandle * world
                 guard local.x > lo.x, local.y > lo.y, local.z > lo.z, local.x < hi.x, local.y < hi.y, local.z < hi.z else { continue }
                 let key = SIMD3<Int32>(Int32((world.x * 100).rounded()), Int32((world.y * 100).rounded()), Int32((world.z * 100).rounded()))
@@ -370,8 +400,8 @@ final class StepScanModel: NSObject, ObservableObject {
     }
 
     /// One camera frame as a JPEG, upright, about 1000 pixels tall, for the screw check.
-    private static func photo(frame: ARFrame) -> Data? {
-        let image = CIImage(cvPixelBuffer: frame.capturedImage).oriented(.right)
+    nonisolated private static func photo(_ pixels: CVPixelBuffer) -> Data? {
+        let image = CIImage(cvPixelBuffer: pixels).oriented(.right)
         let scaled = image.transformed(by: CGAffineTransform(scaleX: 0.55, y: 0.55))
         guard let cg = CIContext().createCGImage(scaled, from: scaled.extent) else { return nil }
         return UIImage(cgImage: cg).jpegData(compressionQuality: 0.7)
@@ -387,6 +417,7 @@ final class StepScanModel: NSObject, ObservableObject {
         let world = AnchorEntity(world: matrix_identity_float4x4)
         let node = Entity()
         node.transform = Transform(matrix: Self.matrix(result.transform) ?? fallback)
+        fitted = Self.matrix(result.transform)
         let status = Dictionary(result.parts.map { ($0.id, $0.status) }, uniquingKeysWith: { a, _ in a })
         for part in ghost.parts where !part.fastener {
             let (color, opacity): (UIColor, Float) = switch status[part.id] {
@@ -430,10 +461,14 @@ final class StepScanModel: NSObject, ObservableObject {
         resultAnchor?.removeFromParent()
         resultAnchor = nil
         arView.debugOptions.remove(.showSceneUnderstanding)
-        if let anchor, let handle, let ghost {
+        if let anchor, let handle {
             anchor.isEnabled = true
-            var gestures: ARView.EntityGestures = [.translation, .rotation]
-            if ghost.metres_per_unit == nil { gestures.insert(.scale) }
+            // start the next scan from where the last one put the model: the furniture's real place and size
+            if let fitted {
+                let inner = modelNode.transformMatrix(relativeTo: handle)
+                handle.setTransformMatrix(fitted * inner.inverse, relativeTo: nil)
+            }
+            let gestures: ARView.EntityGestures = [.translation, .rotation, .scale]   // pinch to match furniture of any size; the server fits the exact size
             arView.installGestures(gestures, for: handle)
             phase = .aligning
             hint = "Check the ghost still sits over your furniture, then scan again."

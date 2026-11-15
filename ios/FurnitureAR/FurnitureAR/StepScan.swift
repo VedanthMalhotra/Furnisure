@@ -62,6 +62,8 @@ struct CheckResult: Decodable {
     let parts: [Part]
     let extras: [Extra]
     let advice: Advice?
+    let missing: [String]?     // short plain names, e.g. "back panel", "2 x rod"
+    let resized: Float?        // real furniture size / model size, when they differ by more than 5%
 }
 
 private struct CheckBody: Encodable {
@@ -93,11 +95,20 @@ enum StepCheckAPI {
         return try JSONDecoder().decode(GhostResponse.self, from: data)
     }
 
+    /// One session with a hard limit on the whole exchange, not just on each quiet spell
+    private static let session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 90
+        config.timeoutIntervalForResource = 150
+        config.waitsForConnectivity = false
+        return URLSession(configuration: config)
+    }()
+
     static func check(server: String, request: ScanRequest, ghost: simd_float4x4,
-                      points: [SIMD3<Float>], photo: Data?) async throws -> CheckResult {
+                      points: [SIMD3<Float>], photo: Data?, status: @escaping (String) -> Void) async throws -> CheckResult {
         var flat = [Float]()
         flat.reserveCapacity(points.count * 3)
-        for p in points { flat += [p.x, p.y, p.z] }
+        for p in points { flat.append(p.x); flat.append(p.y); flat.append(p.z) }
         let pointData = flat.withUnsafeBufferPointer { Data(buffer: $0) }
         let columns = [ghost.columns.0, ghost.columns.1, ghost.columns.2, ghost.columns.3]
         let body = CheckBody(step: request.step, captions: request.captions, installed: request.installed,
@@ -106,11 +117,15 @@ enum StepCheckAPI {
                              points: pointData.base64EncodedString(), photo: photo?.base64EncodedString())
         let path = "/api/stepcheck/\(request.kit.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? request.kit)"
         guard let url = URL(string: server + path) else { throw Failure(message: "Bad server address") }
-        var http = URLRequest(url: url, timeoutInterval: 150)   // the photo check calls Gemini
+        var http = URLRequest(url: url, timeoutInterval: 90)
         http.httpMethod = "POST"
         http.setValue("application/json", forHTTPHeaderField: "Content-Type")
         http.httpBody = try JSONEncoder().encode(body)
-        let (data, response) = try await URLSession.shared.data(for: http)
+        let megabytes = String(format: "%.1f", Double(http.httpBody?.count ?? 0) / 1_000_000)
+        print("[StepScan] sending \(points.count) points, \(megabytes) MB to \(url)")
+        status("Sending the scan (\(megabytes) MB)…")
+        let (data, response) = try await session.data(for: http)
+        print("[StepScan] server answered \((response as? HTTPURLResponse)?.statusCode ?? 0), \(data.count) bytes")
         try check(response, data)
         return try JSONDecoder().decode(CheckResult.self, from: data)
     }
