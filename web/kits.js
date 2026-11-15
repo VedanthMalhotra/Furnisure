@@ -523,10 +523,48 @@ function setPlan(plan, pdf) {
   showStep(0);
 }
 
+// While Gemini reads a manual, the model stays hidden behind a progress card. When the steps are ready
+// the card says so, and the walkthrough starts from step 1 once the person taps OK.
+async function prepare(work) {
+  const stages = [[0,'Gemini is reading the pages.'],[8,'Finding the parts on each page…'],
+    [20,'Working out the order of the steps…'],[40,'Building the 3D animation…'],[75,'Almost there, a big manual takes longer…']];
+  document.body.classList.add('preparing');
+  $('prep').hidden = false;
+  $('prep-wait').hidden = false;
+  $('prep-ready').hidden = true;
+  const started = Date.now();
+  const tick = () => {
+    const seconds = (Date.now()-started)/1000;
+    $('prep-stage').textContent = stages.filter(([at]) => seconds >= at).at(-1)[1];
+    $('prep-bar').style.width = Math.min(95, 100*(1-Math.exp(-seconds/30))) + '%';   // never claims to be done early
+    $('prep-time').textContent = seconds < 5 ? 'This usually takes up to a minute.' : Math.round(seconds) + ' s';
+  };
+  tick();
+  const timer = setInterval(tick, 1000);
+  try {
+    await work();
+  } catch (error) {
+    document.body.classList.remove('preparing');
+    $('prep').hidden = true;
+    throw error;
+  } finally { clearInterval(timer); }
+  const printed = new Set(actions.map(item => item.step)).size;
+  $('prep-bar').style.width = '100%';
+  $('prep-summary').textContent = kit?.name ? `${kit.name}: ${printed} step${printed === 1 ? '' : 's'}, animated in 3D.`
+    : `${printed} step${printed === 1 ? '' : 's'}, animated in 3D.`;
+  $('prep-wait').hidden = true;
+  $('prep-ready').hidden = false;
+  $('prep-ok').focus();
+  await new Promise(resolve => { $('prep-ok').onclick = resolve; });
+  $('prep').hidden = true;
+  document.body.classList.remove('preparing');
+  showStep(0);   // replays step 1 now that it can be seen
+}
+
 $('scan').onsubmit = event => {
   event.preventDefault();
   const file = $('pdf').files[0];
-  if (file) perform(() => readManual(file));
+  if (file) perform(() => prepare(() => readManual(file)));
 };
 $('prediction').onchange = async () => {
   try {
@@ -670,30 +708,37 @@ perform(async () => {
   const params = new URLSearchParams(location.search);
   const requested = params.get('kit');
   const selected = catalog.find(item => item.article_number === requested);
-  await load(selected || catalog[0]);
-  if (selected) {
-    const auto = params.has('auto');
-    const read = params.has('read');
-    const fresh = read && params.has('fresh');
-    const kitUrl = '/api/kits/' + encodeURIComponent(selected.article_number);
-    const reference = fresh ? null : await fetch(kitUrl + '/reference-plan' + (auto ? '?auto=true' : ''));
-    if (reference && !reference.ok && reference.status !== 404) {
-      throw new Error('Could not load the annotated steps for this model.');
-    }
-    if (reference?.ok || read) {
-      const manual = await fetch(kitUrl + '/manual');
-      if (!manual.ok) throw new Error('Could not load the matching manual.');
-      const pdf = await manual.blob();
-      if (!reference?.ok) {
-        // Home's match uses the PDF hash, so these are the exact bytes the user selected.
-        await readManual(pdf, fresh);
-        return;
-      }
-      const result = await reference.json();
-      setPlan(result.plan, pdf);
-      status('');
-    } else {
-      status('Model loaded. Upload the matching PDF to generate steps with Gemini.');
-    }
-  } else status('Kit loaded. Upload the matching PDF to generate steps.');
+  if (!selected) {
+    await load(catalog[0]);
+    status('Kit loaded. Upload the matching PDF to generate steps.');
+  } else if (params.has('read')) {
+    // a manual from the home page: keep the model hidden until its steps are ready
+    await prepare(() => openKit(selected, params, true));
+  } else await openKit(selected, params, false);
 });
+
+async function openKit(selected, params, read) {
+  await load(selected);
+  const auto = params.has('auto');
+  const fresh = read && params.has('fresh');
+  const kitUrl = '/api/kits/' + encodeURIComponent(selected.article_number);
+  const reference = fresh ? null : await fetch(kitUrl + '/reference-plan' + (auto ? '?auto=true' : ''));
+  if (reference && !reference.ok && reference.status !== 404) {
+    throw new Error('Could not load the annotated steps for this model.');
+  }
+  if (!reference?.ok && !read) {
+    status('Model loaded. Upload the matching PDF to generate steps with Gemini.');
+    return;
+  }
+  const manual = await fetch(kitUrl + '/manual');
+  if (!manual.ok) throw new Error('Could not load the matching manual.');
+  const pdf = await manual.blob();
+  if (!reference?.ok) {
+    // Home's match uses the PDF hash, so these are the exact bytes the user selected.
+    await readManual(pdf, fresh);
+    return;
+  }
+  const result = await reference.json();
+  setPlan(result.plan, pdf);
+  status('');
+}

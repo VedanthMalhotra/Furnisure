@@ -42,7 +42,7 @@ struct CheckResult: Decodable {
     struct Part: Decodable, Identifiable {
         let id: Int
         let name: String
-        let status: String     // ok, missing, unsure, hardware
+        let status: String     // ok, missing, misplaced, unsure, hardware
         let message: String
         let active: Bool?
     }
@@ -63,6 +63,7 @@ struct CheckResult: Decodable {
     let extras: [Extra]
     let advice: Advice?
     let missing: [String]?     // short plain names, e.g. "back panel", "2 x rod"
+    let misplaced: [String]?   // on but wrong, e.g. "top right panel slanted"
     let resized: Float?        // real furniture size / model size, when they differ by more than 5%
 }
 
@@ -76,6 +77,7 @@ private struct CheckBody: Encodable {
     let ghost: [Float]
     let points: String
     let photo: String?
+    let fitted: Bool
 }
 
 enum StepCheckAPI {
@@ -105,7 +107,7 @@ enum StepCheckAPI {
     }()
 
     static func check(server: String, request: ScanRequest, ghost: simd_float4x4,
-                      points: [SIMD3<Float>], photo: Data?, status: @escaping (String) -> Void) async throws -> CheckResult {
+                      points: [SIMD3<Float>], photo: Data?, fitted: Bool, status: @escaping (String) -> Void) async throws -> CheckResult {
         var flat = [Float]()
         flat.reserveCapacity(points.count * 3)
         for p in points { flat.append(p.x); flat.append(p.y); flat.append(p.z) }
@@ -114,7 +116,7 @@ enum StepCheckAPI {
         let body = CheckBody(step: request.step, captions: request.captions, installed: request.installed,
                              active: request.active, future: request.future, hardware: request.hardware,
                              ghost: columns.flatMap { [$0.x, $0.y, $0.z, $0.w] },
-                             points: pointData.base64EncodedString(), photo: photo?.base64EncodedString())
+                             points: pointData.base64EncodedString(), photo: photo?.base64EncodedString(), fitted: fitted)
         let path = "/api/stepcheck/\(request.kit.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? request.kit)"
         guard let url = URL(string: server + path) else { throw Failure(message: "Bad server address") }
         var http = URLRequest(url: url, timeoutInterval: 90)

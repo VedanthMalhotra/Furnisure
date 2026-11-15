@@ -85,7 +85,7 @@ struct StepScanView: View {
     }
 
     private func resultCard(_ result: CheckResult) -> some View {
-        let problems = result.parts.filter { $0.status == "missing" }
+        let problems = result.parts.filter { $0.status == "missing" || $0.status == "misplaced" }
         let resized = result.resized.map { $0 > 1 ? "Your furniture is \(Int(($0 - 1) * 100 + 0.5))% bigger than the model; the model was resized to fit."
                                                   : "Your furniture is \(Int((1 - $0) * 100 + 0.5))% smaller than the model; the model was resized to fit." }
         let unsure = result.parts.filter { $0.status == "unsure" }
@@ -104,6 +104,12 @@ struct StepScanView: View {
                     ForEach(missing, id: \.self) { Text("• " + $0).font(.subheadline) }
                 }
             }
+            if let wrong = result.misplaced, !wrong.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Out of place").font(.subheadline.bold()).foregroundStyle(.red)
+                    ForEach(wrong, id: \.self) { Text("• " + $0).font(.subheadline) }
+                }
+            }
             if let summary = result.summary { Text(summary).font(.subheadline) }
             if let advice = result.advice {
                 Text(advice.summary).font(.subheadline)
@@ -112,10 +118,10 @@ struct StepScanView: View {
             ForEach(Array(result.extras.enumerated()), id: \.offset) { Text("• " + $0.element.message).font(.footnote).foregroundStyle(.red) }
             if let resized { Text(resized).font(.footnote).foregroundStyle(.secondary) }
             if !unsure.isEmpty {
-                Text("Not sure about: " + unsure.map(\.name).joined(separator: ", ")).font(.footnote).foregroundStyle(.secondary)
+                Text("Not sure about: " + Self.plainList(unsure.map(\.name)).joined(separator: ", ")).font(.footnote).foregroundStyle(.secondary)
             }
             if !problems.isEmpty || !result.extras.isEmpty {
-                Text("Tap a red part to see what's wrong.").font(.footnote).foregroundStyle(.secondary)
+                Text("Green parts are right. Tap a red part to see what's wrong.").font(.footnote).foregroundStyle(.secondary)
             }
             HStack {
                 Button { scan.restart() } label: { Text("Scan again").frame(maxWidth: .infinity) }
@@ -129,6 +135,17 @@ struct StepScanView: View {
         }
         .padding(14)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    /// "Rod_2_1", "Rod_3_2" -> "2 x rod", like the server's missing list.
+    static func plainList(_ names: [String]) -> [String] {
+        var counts: [(String, Int)] = []
+        for name in names {
+            var plain = name.replacingOccurrences(of: #"([_\s]+\d+)+$"#, with: "", options: .regularExpression)
+            plain = plain.replacingOccurrences(of: "_", with: " ").lowercased()
+            if let i = counts.firstIndex(where: { $0.0 == plain }) { counts[i].1 += 1 } else { counts.append((plain, 1)) }
+        }
+        return counts.map { $0.1 > 1 ? "\($0.1) x \($0.0)" : $0.0 }
     }
 
     private func partCard(_ part: StepScanModel.Selection) -> some View {
@@ -248,7 +265,7 @@ final class StepScanModel: NSObject, ObservableObject {
             if name.hasPrefix("extra-"), let i = Int(name.dropFirst(6)), i < result.extras.count {
                 selected = Selection(title: "Out of place", message: result.extras[i].message)
             } else if let id = Int(name.dropFirst(5)), let part = result.parts.first(where: { $0.id == id }) {
-                let status = ["ok": "In place", "missing": "Missing or not in place", "unsure": "Not sure"][part.status] ?? part.status
+                let status = ["ok": "In place", "missing": "Missing", "misplaced": "Out of place", "unsure": "Not sure"][part.status] ?? part.status
                 selected = Selection(title: "\(part.name) · \(status)", message: part.message)
             }
         default:
@@ -422,7 +439,7 @@ final class StepScanModel: NSObject, ObservableObject {
         hint = "Comparing your furniture with the model… up to a minute."
         do {
             let result = try await StepCheckAPI.check(server: server, request: request, ghost: ghostMatrix,
-                                                      points: points, photo: photo) { [weak self] status in
+                                                      points: points, photo: photo, fitted: liveGhost != nil) { [weak self] status in
                 Task { @MainActor in self?.hint = status }
             }
             log("result \(result.verdict) after \(Self.seconds(since: started))")
@@ -483,10 +500,10 @@ final class StepScanModel: NSObject, ObservableObject {
         node.transform = Transform(matrix: Self.matrix(result.transform) ?? fallback)
         fitted = Self.matrix(result.transform)
         let status = Dictionary(result.parts.map { ($0.id, $0.status) }, uniquingKeysWith: { a, _ in a })
-        for part in ghost.parts where !part.fastener {
+        for part in ghost.parts where !part.fastener || status[part.id] == "missing" || status[part.id] == "misplaced" {
             let (color, opacity): (UIColor, Float) = switch status[part.id] {
             case "ok": (.systemGreen, 0.45)
-            case "missing": (.systemRed, 0.7)
+            case "missing", "misplaced": (.systemRed, 0.7)
             default: (.systemYellow, 0.4)
             }
             if let entity = Self.partEntity(part, color: color, opacity: opacity) {
