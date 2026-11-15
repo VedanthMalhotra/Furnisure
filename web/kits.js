@@ -1,12 +1,13 @@
 import * as THREE from 'three';
 import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
 import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+import {makeAllenKey, keySize} from './allenkey.js';
 
 const $ = id => document.getElementById(id);
 const camera = new THREE.PerspectiveCamera(40,1,.001,100);
 const views = ['left','right'].map(id => {
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0xefebe4);
+  scene.background = new THREE.Color(0xe8ede2);
   scene.add(new THREE.HemisphereLight(0xffffff,0x717971,2));
   const light = new THREE.DirectionalLight(0xffffff,2);
   light.position.set(2,4,3);
@@ -22,7 +23,7 @@ controls.addEventListener('start',() => { glide = undefined; });   // the user's
 const loader = new GLTFLoader();
 const assemblyCenter = new THREE.Vector3();
 let catalog, kit, model, parts, prediction, actions = [], step = 0, started = 0;
-let busy = false, playing = false, recording = false, recordFrame, travel, sourceUrl, referenceSource = false;
+let busy = false, playing = false, recording = false, recordFrame, travel, sourceUrl;
 const interval = 1700;
 let extras = [];                         // ids of hardware drawn in because the model leaves it out
 let hardwareSpecs = {};                  // id -> {kind, ...} for that drawn hardware
@@ -84,6 +85,32 @@ function spin(part, angle) {
 }
 
 function status(message) { $('status').textContent = message; }
+
+// An allen key on every screw that is being turned. `driven` lists them for this frame:
+// { part, from (the way the screw came in, or null), angle (how far it has turned) }.
+const keys = [], Z = new THREE.Vector3(0,0,1);
+function driveKeys(driven, progress, settle) {
+  driven.forEach(({part,from,angle}, i) => {
+    if (!keys[i]) views[0].scene.add(keys[i] = makeAllenKey());
+    const key = keys[i], {object} = part;
+    object.updateWorldMatrix(true,true);
+    const box = new THREE.Box3().setFromObject(object), centre = box.getCenter(new THREE.Vector3());
+    const axis = part.localAxis.clone().applyQuaternion(object.getWorldQuaternion(new THREE.Quaternion())).normalize();
+    // the head is at the end the screw came in from; without a path, the end facing away from the product
+    const outward = from && from.lengthSq() > 1e-12 ? from : centre.clone().sub(assemblyCenter);
+    const side = axis.dot(outward) < 0 ? -1 : 1, dir = axis.clone().multiplyScalar(side);
+    const size = box.getSize(new THREE.Vector3());
+    const length = Math.abs(dir.x)*size.x + Math.abs(dir.y)*size.y + Math.abs(dir.z)*size.z;
+    const width = Math.max(size.x*(1-Math.abs(dir.x)),size.y*(1-Math.abs(dir.y)),size.z*(1-Math.abs(dir.z)));
+    const scale = keySize(length,width);
+    key.scale.setScalar(scale);
+    key.position.copy(centre).addScaledVector(dir,length/2 + scale*(.6*settle-.08));   // lifts off once the screw is in
+    key.quaternion.setFromUnitVectors(Z,dir).multiply(new THREE.Quaternion().setFromAxisAngle(Z,angle*side));
+    key.userData.material.opacity = Math.min(1,progress*6)*(1-settle);
+    key.visible = key.userData.material.opacity > .01;
+  });
+  for (let i = driven.length; i < keys.length; i++) keys[i].visible = false;
+}
 
 // Hardware drawn from a profile when no real IKEA model fits: the same shapes as templates.js,
 // in millimetres, tip at the origin, +Z toward the head.
@@ -205,16 +232,7 @@ function showStep(index) {
   const action = actions[index];
   $('step').textContent = action ? 'Step ' + action.step + ' · ' + action.caption : 'Finished IKEA model';
   if (parts) focusOn(action);
-  $('source').hidden = !action;
-  if (action) {
-    $('page-image').hidden = !referenceSource;
-    $('page').hidden = referenceSource;
-    if (referenceSource) $('page-image').src = '/api/kits/' + encodeURIComponent(kit.article_number) + '/pages/' + action.page;
-    else {
-      const url = sourceUrl + '#page=' + action.page;
-      if ($('page').src !== url) $('page').src = url;
-    }
-  }
+  $('source').hidden = true;     // the manual page stays out of the way of the 3D model
   if (prediction) {
     const predicted = prediction.steps.find(item => item.step === action?.step);
     const expected = new Set(actions.filter(item => item.step === action?.step).flatMap(item => item.nodes));
@@ -381,6 +399,7 @@ function tick(now) {
       if (earlierSteps.has(item.step)) for (const pose of item.poses) playback.set(pose.node,pose);
     }
   }
+  const driven = [];                     // screws being turned in this frame, for the allen keys
   for (const [id,part] of parts) {
     const {object,position,rotation,localAxis,slender,length,centered} = part;
     object.visible = !action || previous.has(id) || active.has(id);
@@ -399,6 +418,8 @@ function tick(now) {
       object.position.copy(object.parent.worldToLocal(world));
       if (active.has(id) && move?.turns) {
         spin(part,(progress-1)*Math.PI*2*move.turns);
+        if (slender) driven.push({part,angle:(progress-1)*Math.PI*2*move.turns,
+          from:new THREE.Vector3(...(move.path?.[0] ?? move.start)).sub(new THREE.Vector3(...(move.path?.at(-1) ?? move.end)))});
       }
     } else if (active.has(id) && action.entry_target !== undefined) {
       const target = parts.get(action.entry_target).worldPosition;
@@ -407,6 +428,7 @@ function tick(now) {
         const shaft = localAxis.clone().applyQuaternion(object.getWorldQuaternion(new THREE.Quaternion()));
         direction.copy(shaft.multiplyScalar(direction.dot(shaft) < 0 ? -1 : 1));
         spin(part,(progress-1)*Math.PI*3);
+        driven.push({part,from:direction.clone(),angle:(progress-1)*Math.PI*3});
       }
       const distance = THREE.MathUtils.lerp(action.distance,action.seat_offset ?? 0,progress);
       const position = object.getWorldPosition(new THREE.Vector3()).addScaledVector(direction.normalize(),distance);
@@ -430,10 +452,12 @@ function tick(now) {
     }
     if (active.has(id) && action.motion === 'tighten' && isFastener && action.entry_target === undefined && !keyed) {
       spin(part,(progress-1)*Math.PI*2);
+      driven.push({part,from:null,angle:(progress-1)*Math.PI*2});
     }
   }
   // Glow on the parts being fitted, fading out once they are seated
   const settle = Math.min(1,Math.max(0,(now-started-span*.75)/350));
+  driveKeys(driven,progress,settle);
   for (const [id,part] of parts) {
     const k = action && active.has(id) ? 0.32*(1-settle) : 0;
     for (const material of part.materials) material.emissive.copy(material.userData.baseEmissive).lerp(GLOW,k);
@@ -470,28 +494,33 @@ async function perform(work) {
   finally { busy = false; updateControls(); }
 }
 
+async function readManual(pdf, fresh = false) {
+  status('Reading the PDF and preparing the walkthrough…');
+  const body = new FormData();
+  body.append('file', pdf, pdf.name || 'manual.pdf');
+  const response = await fetch(`/api/kits/scan?fresh=${fresh}`, {method:'POST', body});
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.detail);
+  await load(result.kit);
+  await addHardware(result.plan.hardware);
+  setPlan(result.plan, pdf);
+  status(kit.name + ' · ' + kit.manual_id + ' · Review the parts and illustrative motion before export.');
+}
+
+function setPlan(plan, pdf) {
+  if (sourceUrl) URL.revokeObjectURL(sourceUrl);
+  sourceUrl = URL.createObjectURL(pdf);
+  actions = plan.actions;
+  $('review').checked = false;
+  $('issues').textContent = plan.unresolved.join('\n');
+  $('issues').hidden = !plan.unresolved.length;
+  showStep(0);
+}
+
 $('scan').onsubmit = event => {
   event.preventDefault();
-  perform(async () => {
-    status('Reading the PDF and matching its kit…');
-    const file = $('pdf').files[0];
-    const body = new FormData();
-    body.append('file',file);
-    const response = await fetch('/api/kits/scan',{method:'POST',body});
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.detail);
-    await load(result.kit);
-    await addHardware(result.plan.hardware);
-    if (sourceUrl) URL.revokeObjectURL(sourceUrl);
-    sourceUrl = URL.createObjectURL(file);
-    referenceSource = false;
-    actions = result.plan.actions;
-    $('review').checked = false;
-    $('issues').textContent = result.plan.unresolved.join('\n');
-    $('issues').hidden = !result.plan.unresolved.length;
-    showStep(0);
-    status(kit.name + ' · ' + kit.manual_id + ' · Review the parts and illustrative motion before export.');
-  });
+  const file = $('pdf').files[0];
+  if (file) perform(() => readManual(file));
 };
 $('kit').onchange = () => perform(async () => {
   await load(catalog.find(item => item.article_number === $('kit').value));
@@ -640,27 +669,35 @@ perform(async () => {
   if (!response.ok) throw new Error('Could not load the kit catalog.');
   catalog = await response.json();
   for (const item of catalog) $('kit').add(new Option(item.name+' · '+item.article_number,item.article_number));
-  const requested = new URLSearchParams(location.search).get('kit');
+  const params = new URLSearchParams(location.search);
+  const requested = params.get('kit');
   const selected = catalog.find(item => item.article_number === requested);
   await load(selected || catalog[0]);
   if (selected) {
-    const auto = new URLSearchParams(location.search).has('auto');
-    const response = await fetch('/api/kits/' + encodeURIComponent(selected.article_number) + '/reference-plan' + (auto ? '?auto=true' : ''));
-    if (response.ok) {
-      const result = await response.json();
-      actions = result.plan.actions;
-      const manual = await fetch('/api/kits/' + encodeURIComponent(selected.article_number) + '/manual');
+    const auto = params.has('auto');
+    const read = params.has('read');
+    const fresh = read && params.has('fresh');
+    const kitUrl = '/api/kits/' + encodeURIComponent(selected.article_number);
+    const reference = fresh ? null : await fetch(kitUrl + '/reference-plan' + (auto ? '?auto=true' : ''));
+    if (reference && !reference.ok && reference.status !== 404) {
+      throw new Error('Could not load the annotated steps for this model.');
+    }
+    if (reference?.ok || read) {
+      const manual = await fetch(kitUrl + '/manual');
       if (!manual.ok) throw new Error('Could not load the matching manual.');
-      sourceUrl = URL.createObjectURL(await manual.blob());
-      referenceSource = true;
-      $('issues').textContent = result.plan.unresolved.join('\n');
-      $('issues').hidden = !result.plan.unresolved.length;
-      showStep(0);
+      const pdf = await manual.blob();
+      if (!reference?.ok) {
+        // Home's match uses the PDF hash, so these are the exact bytes the user selected.
+        await readManual(pdf, fresh);
+        return;
+      }
+      const result = await reference.json();
+      setPlan(result.plan, pdf);
       if (selected.checked_plan && auto) status('Saved BEKVÄM steps with motion computed from the 3D model.');
       else if (selected.checked_plan) status('Saved BEKVÄM walkthrough with individual rail, dowel, and screw actions.');
       else status('Using dataset assembly annotations. Step numbers are dataset stages; compare the displayed manual. Motion is illustrative.');
-    } else if (response.status === 404) {
+    } else {
       status('Model loaded. Upload the matching PDF to generate steps with Gemini.');
-    } else throw new Error('Could not load the annotated steps for this model.');
+    }
   } else status('Kit loaded. Upload the matching PDF to generate steps.');
 });
