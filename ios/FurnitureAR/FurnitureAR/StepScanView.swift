@@ -177,6 +177,9 @@ final class StepScanModel: NSObject, ObservableObject {
     private var result: CheckResult?
     private var tapInstalled = false
     private var fitted: simd_float4x4?           // where the last scan placed the model (with its size)
+    private let cloud = DepthCloud()
+    private var fitTask: Task<Void, Never>?
+    private var liveGhost: simd_float4x4?        // where the live fit last moved the model
 
     private static let tips: [simd_quatf] = [
         simd_quatf(angle: 0, axis: [1, 0, 0]),
@@ -197,6 +200,9 @@ final class StepScanModel: NSObject, ObservableObject {
         let config = ARWorldTrackingConfiguration()
         config.planeDetection = [.horizontal]
         config.sceneReconstruction = .mesh
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+            config.frameSemantics.insert(.sceneDepth)   // raw LiDAR depth: keeps rods and thin boards the mesh smooths away
+        }
         arView.session.run(config)
         if !tapInstalled {
             arView.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped(_:))))
@@ -213,6 +219,7 @@ final class StepScanModel: NSObject, ObservableObject {
 
     func stop() {
         scanTask?.cancel()
+        fitTask?.cancel()
         arView.session.pause()
     }
 
@@ -231,7 +238,7 @@ final class StepScanModel: NSObject, ObservableObject {
                 hint = "Couldn't find the floor there. Move the phone around a little and tap the floor again."
                 return
             }
-            place(at: hit.worldTransform)
+            place(at: Self.facingCamera(at: hit.worldTransform, camera: arView.cameraTransform.translation))
         case .result:
             var entity = arView.entity(at: point)
             while let current = entity, !current.name.hasPrefix("part-"), !current.name.hasPrefix("extra-") {
@@ -247,6 +254,17 @@ final class StepScanModel: NSObject, ObservableObject {
         default:
             break
         }
+    }
+
+    /// The tapped floor point, turned so the model's front (+z) faces the camera. A floor hit's own
+    /// rotation follows ARKit's plane, which points any which way.
+    private static func facingCamera(at hit: simd_float4x4, camera: SIMD3<Float>) -> simd_float4x4 {
+        let spot = SIMD3(hit.columns.3.x, hit.columns.3.y, hit.columns.3.z)
+        let toward = camera - spot
+        let yaw = atan2(toward.x, toward.z)
+        var m = simd_float4x4(simd_quatf(angle: yaw, axis: [0, 1, 0]))
+        m.columns.3 = SIMD4(spot, 1)
+        return m
     }
 
     private func place(at transform: simd_float4x4) {
@@ -273,7 +291,7 @@ final class StepScanModel: NSObject, ObservableObject {
         let gestures: ARView.EntityGestures = [.translation, .rotation, .scale]   // pinch to match furniture of any size; the server fits the exact size
         arView.installGestures(gestures, for: handle)
         phase = .aligning
-        hint = "Drag, twist and pinch the ghost until it sits over your furniture and is about its size. Orange parts are this step's."
+        hint = "Drag the ghost onto your furniture. It doesn't have to be exact: the scan works out the turn and size. Orange parts are this step's."
     }
 
     /// Tips the ghost onto its next side, for steps built lying down.
@@ -320,35 +338,82 @@ final class StepScanModel: NSObject, ObservableObject {
         // the ghost stays put while scanning
         arView.gestureRecognizers?.filter { $0 is EntityGestureRecognizer }.forEach { arView.removeGestureRecognizer($0) }
         arView.debugOptions.insert(.showSceneUnderstanding)   // shows the mesh building up as they walk
-        hint = "Walk slowly all the way around your furniture, keeping it on screen."
+        hint = "Walk slowly all the way around your furniture, keeping it on screen. The ghost moves onto it as it's found."
+        let area = scanArea()
+        cloud.reset()
+        liveGhost = nil
         scanTask = Task { [weak self] in
             let start = Date()
+            var tick = 0
             while let self, !Task.isCancelled {
                 let progress = min(1, Date().timeIntervalSince(start) / Self.scanSeconds)
                 self.phase = .scanning(progress)
                 if progress >= 1 { break }
+                // five depth frames a second is plenty while walking slowly
+                if tick % 2 == 0, let frame = self.arView.session.currentFrame, let depth = DepthCloud.frame(from: frame) {
+                    self.cloud.add(depth, area: area)
+                }
+                tick += 1
                 try? await Task.sleep(nanoseconds: 100_000_000)
             }
             guard let self, !Task.isCancelled else { return }
             await self.finishScan()
         }
+        fitTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            while let self, !Task.isCancelled {
+                await self.liveFit()
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    /// A round area around the ghost, not its box: a ghost turned the wrong way must not cut off
+    /// part of the furniture (the server finds the right turn and size itself)
+    private func scanArea() -> ScanArea {
+        let box = modelNode.visualBounds(relativeTo: nil)
+        let reach = simd_length(SIMD2(box.extents.x, box.extents.z)) / 2
+        return ScanArea(centre: SIMD2(box.center.x, box.center.z), radius: 1.5 * reach + 0.4,
+                        floor: box.min.y - 0.1, top: box.min.y + 2 * max(box.extents.y, reach) + 0.3)
+    }
+
+    /// Sends the scan so far to the server and slides, turns and resizes the ghost onto the real
+    /// furniture when it fits. The first fit searches widely; later ones only nudge.
+    private func liveFit() async {
+        let points = await cloud.points(cell: 0.02, limit: 20_000)
+        guard points.count >= 300, case .scanning = phase else { return }
+        let ghost = liveGhost ?? modelNode.transformMatrix(relativeTo: nil)
+        do {
+            let fit = try await StepCheckAPI.fit(server: server, request: request, ghost: ghost, points: points, near: liveGhost != nil)
+            guard case .scanning = phase, !Task.isCancelled, let matrix = Self.matrix(fit.transform), let handle else { return }
+            liveGhost = matrix
+            let inner = modelNode.transformMatrix(relativeTo: handle)
+            handle.move(to: Transform(matrix: matrix * inner.inverse), relativeTo: nil, duration: 0.6, timingFunction: .easeInOut)
+            hint = "Found your furniture: the ghost is on it now. Keep walking around it."
+            log("live fit: size \(fit.size ?? 0), \(Int((fit.precision ?? 0) * 100))% on the model")
+        } catch {
+            log("live fit failed: \(error.localizedDescription)")
+        }
     }
 
     private func finishScan() async {
-        guard let frame = arView.session.currentFrame, let handle else { fail("The camera stopped. Try again."); return }
+        guard let frame = arView.session.currentFrame, handle != nil else { fail("The camera stopped. Try again."); return }
+        fitTask?.cancel()
         phase = .checking
         hint = "Collecting the scan…"
         let started = Date()
-        let ghostMatrix = modelNode.transformMatrix(relativeTo: nil)
+        let ghostMatrix = liveGhost ?? modelNode.transformMatrix(relativeTo: nil)
         // Everything the background work needs, copied out of RealityKit and ARKit on the main thread
-        let bounds = modelNode.visualBounds(relativeTo: handle)
-        let toHandle = handle.transformMatrix(relativeTo: nil).inverse
+        let area = scanArea()
         let meshes = frame.anchors.compactMap { $0 as? ARMeshAnchor }
         let pixels = frame.capturedImage
-        log("finish: \(meshes.count) mesh anchors, \(meshes.reduce(0) { $0 + $1.geometry.vertices.count }) vertices")
-        let (points, photo) = await Task.detached(priority: .userInitiated) {
-            (Self.scannedPoints(meshes: meshes, bounds: bounds, toHandle: toHandle), Self.photo(pixels))
-        }.value
+        var points = await cloud.points()
+        let photo = await Task.detached(priority: .userInitiated) { Self.photo(pixels) }.value
+        log("finish: \(points.count) depth points")
+        if points.count < 500 {   // no depth (or almost none): fall back to the scene mesh
+            points = await Task.detached(priority: .userInitiated) { Self.scannedPoints(meshes: meshes, area: area) }.value
+            log("using \(points.count) mesh points instead")
+        }
         log("collected \(points.count) points, photo \(photo?.count ?? 0) bytes in \(Self.seconds(since: started))")
         guard points.count >= 100 else {
             fail("The scan picked up almost nothing near the ghost (\(points.count) points). Line the ghost up with your furniture and walk all the way around it.")
@@ -372,10 +437,9 @@ final class StepScanModel: NSObject, ObservableObject {
     private static func seconds(since date: Date) -> String { String(format: "%.1f s", Date().timeIntervalSince(date)) }
 
     /// The LiDAR mesh vertices near the ghost, in world metres, thinned to one per centimetre.
-    nonisolated private static func scannedPoints(meshes: [ARMeshAnchor], bounds: BoundingBox,
-                                                  toHandle: simd_float4x4) -> [SIMD3<Float>] {
-        let pad: Float = 0.3
-        let lo = bounds.min - SIMD3(pad, 0.05, pad), hi = bounds.max + SIMD3(pad, pad, pad)
+    typealias ScanArea = DepthCloud.Area
+
+    nonisolated private static func scannedPoints(meshes: [ARMeshAnchor], area: ScanArea) -> [SIMD3<Float>] {
         var seen = Set<SIMD3<Int32>>()
         var points = [SIMD3<Float>]()
         for mesh in meshes {
@@ -389,8 +453,8 @@ final class StepScanModel: NSObject, ObservableObject {
                                      base.load(fromByteOffset: at + 4, as: Float.self),
                                      base.load(fromByteOffset: at + 8, as: Float.self), 1)
                 let world = toWorld * v
-                let local = toHandle * world
-                guard local.x > lo.x, local.y > lo.y, local.z > lo.z, local.x < hi.x, local.y < hi.y, local.z < hi.z else { continue }
+                guard world.y > area.floor, world.y < area.top,
+                      simd_length(SIMD2(world.x, world.z) - area.centre) < area.radius else { continue }
                 let key = SIMD3<Int32>(Int32((world.x * 100).rounded()), Int32((world.y * 100).rounded()), Int32((world.z * 100).rounded()))
                 if seen.insert(key).inserted { points.append(SIMD3(world.x, world.y, world.z)) }
                 if points.count >= 120_000 { return points }
@@ -456,6 +520,7 @@ final class StepScanModel: NSObject, ObservableObject {
     /// Back to lining up the ghost, keeping where it was, for a fresh scan after a fix.
     func restart() {
         scanTask?.cancel()
+        fitTask?.cancel()
         selected = nil
         result = nil
         resultAnchor?.removeFromParent()

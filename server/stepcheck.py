@@ -38,6 +38,7 @@ CONTACT = 0.008      # model samples this close to another part are hidden in a 
 DISTINCT = 0.03     # a part is judged by its surface at least this far from every other part
 EXTRA = 0.035       # scan points farther than this from every expected part are unexplained
 GHOST_TRIANGLES = 6000
+SAVED = ROOT.parent.parent / "server" / "jobs" / "scans"
 ADVICE_SECONDS = 50  # Gemini takes 4 to 40 s; the phone waits 90 s for the whole answer
 
 
@@ -153,21 +154,42 @@ def _umeyama(src, dst, with_scale):
     return s, r, mu_d - s * r @ mu_s
 
 
-def _icp(scan, target, unit, with_scale):
+def _umeyama_upright(src, dst, axis):
+    """Like _umeyama with scale, but the rotation only turns about `axis` (the world's up), so the
+    furniture can never be tipped over by the fit."""
+    e1 = np.cross(axis, [1.0, 0, 0] if abs(axis[0]) < 0.9 else [0, 1.0, 0])
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(axis, e1)
+    mu_s, mu_d = src.mean(0), dst.mean(0)
+    xs, xd = src - mu_s, dst - mu_d
+    a, b, c = xs @ e1, xs @ e2, xs @ axis
+    p, q, w = xd @ e1, xd @ e2, xd @ axis
+    C, S = float((p * a + q * b).sum()), float((q * a - p * b).sum())
+    angle = math.atan2(S, C)
+    r = _turn(axis, angle)
+    s = (C * math.cos(angle) + S * math.sin(angle) + float((w * c).sum())) / float((xs ** 2).sum())
+    return s, r, mu_d - s * r @ mu_s
+
+
+def _icp(scan, target, unit, with_scale, tree=None, start_gate=0.25, rounds=36, axis=None):
     """Moves scan (model units) onto target samples. Returns the 4x4 similarity and the fit.
-    `unit` is metres per model unit at the ghost's scale, so the distance gates stay in metres."""
-    tree = cKDTree(target)
+    `unit` is metres per model unit at the ghost's scale, so the distance gates stay in metres.
+    With `axis`, the scan only turns about that axis (it stays standing the way it was)."""
+    tree = tree or cKDTree(target)
     total = np.eye(4)
     moved = scan.copy()
-    gates = np.geomspace(0.25, 0.015, 36) / unit   # recovers a ghost placed up to ~25 cm off
+    gates = np.geomspace(start_gate, 0.015, rounds) / unit   # recovers a ghost placed up to ~25 cm off
     rmse, inliers = float("inf"), 0
     size = 1.0
     for gate in list(gates) + [gates[-1]] * 10:
-        d, idx = tree.query(moved, distance_upper_bound=gate)
+        d, idx = tree.query(moved, distance_upper_bound=gate, workers=-1)
         ok = np.isfinite(d)
         if ok.sum() < 30:
             break
-        s, r, t = _umeyama(moved[ok], target[idx[ok]], with_scale)
+        if axis is not None:
+            s, r, t = _umeyama_upright(moved[ok], target[idx[ok]], axis)
+        else:
+            s, r, t = _umeyama(moved[ok], target[idx[ok]], with_scale)
         # size may only drift a little per round, and at most halve or double overall
         s = float(np.clip(s, 0.97, 1.03))
         s = float(np.clip(size * s, 0.5, 2.0) / size)
@@ -178,9 +200,144 @@ def _icp(scan, target, unit, with_scale):
         moved = moved @ (s * r).T + t
         total = step @ total
         rmse, inliers = float(np.sqrt((d[ok] ** 2).mean())) * unit, int(ok.sum())
-        if np.abs(step - np.eye(4)).max() < 1e-6:
+        if gate <= gates[-1] and np.abs(step - np.eye(4)).max() < 1e-5:
             break
     return total, moved, rmse, inliers
+
+
+def _turn(axis, angle):
+    """Rotation matrix about a unit axis."""
+    x, y, z = axis
+    c, s = math.cos(angle), math.sin(angle)
+    k = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]])
+    return np.eye(3) + s * k + (1 - c) * k @ k
+
+
+def _onto(a, b):
+    """Smallest rotation taking unit vector a onto unit vector b."""
+    v, c = np.cross(a, b), float(np.dot(a, b))
+    if np.linalg.norm(v) < 1e-9:
+        if c > 0:
+            return np.eye(3)
+        other = np.array([1.0, 0, 0]) if abs(a[0]) < 0.9 else np.array([0, 1.0, 0])
+        return _turn(np.cross(a, other) / np.linalg.norm(np.cross(a, other)), math.pi)
+    return _turn(v / np.linalg.norm(v), math.atan2(np.linalg.norm(v), c))
+
+
+def _match(points, target_tree, target, tol):
+    """How well points sit on the model: share of points on it, share of it covered, and their F1."""
+    d, _ = target_tree.query(points, distance_upper_bound=tol, workers=-1)
+    precision = float(np.isfinite(d).mean())
+    d, _ = cKDTree(points).query(target, distance_upper_bound=tol, workers=-1)
+    recall = float(np.isfinite(d).mean())
+    return precision, recall, 2 * precision * recall / (precision + recall + 1e-9)
+
+
+class _Grid:
+    """Fast rough version of _match for the coarse search: points and model fall into cubes of side
+    `cell`; a point counts as on the model when its cube or a neighbouring one holds model."""
+    def __init__(self, model, cell):
+        self.cell, self.lo = cell, model.min(0) - 3 * cell
+        self.shape = tuple(np.ceil((model.max(0) + 3 * cell - self.lo) / cell).astype(int) + 1)
+        self.model_idx = self._index(model)[0]
+        occupied = np.zeros(self.shape, dtype=bool)
+        occupied[tuple(self.model_idx.T)] = True
+        self.near_model = ndimage.binary_dilation(occupied, np.ones((3, 3, 3)))
+
+    def _index(self, points):
+        idx = np.floor((points - self.lo) / self.cell).astype(int)
+        inside = np.all((idx >= 0) & (idx < self.shape), axis=1)
+        return idx[inside], inside
+
+    def score(self, points):
+        idx, inside = self._index(points)
+        precision = float(self.near_model[tuple(idx.T)].sum()) / max(len(points), 1)
+        hit = np.zeros(self.shape, dtype=bool)
+        hit[tuple(idx.T)] = True
+        recall = float(ndimage.binary_dilation(hit, np.ones((3, 3, 3)))[tuple(self.model_idx.T)].mean())
+        return precision, recall, 2 * precision * recall / (precision + recall + 1e-9)
+
+
+def _footprint_precision(points, model, tree, tol, margin):
+    """Share of the scan points over the model's own footprint that lie on it. Walls and objects
+    farther away do not count against the fit."""
+    lo, hi = model.min(0) - margin, model.max(0) + margin
+    inside = points[np.all((points > lo) & (points < hi), axis=1)]
+    if len(inside) < 50:
+        return 0.0, int(len(inside))
+    d, _ = tree.query(inside, distance_upper_bound=tol, workers=-1)
+    return float(np.isfinite(d).mean()), int(len(inside))
+
+
+def _fit(scan, target, unit, up, pivot, near=False):
+    """Finds how the furniture sits under the ghost: turned any way about the world's up, up to 40%
+    bigger or smaller, and up to ~20 cm off. It is never tipped over: it stands the way the ghost
+    stands (the person tips the ghost for furniture built lying down). `scan` is in model units as the
+    ghost placed it, `up` the world's up in that frame, `pivot` a floor point under the ghost's middle.
+    With `near`, only small changes are tried: the ghost already sits about right (live updates).
+    Returns the 4x4 move of the scan onto the model, the moved scan, rmse (m), inliers and a summary."""
+    rng = np.random.default_rng(0)
+    pick = lambda pts, n: pts[rng.choice(len(pts), min(len(pts), n), replace=False)]
+    probe, model = pick(scan, 1500), pick(target, 3000)
+    target_tree = cKDTree(target)
+    tree = cKDTree(model)
+    grid = _Grid(target, 0.04 / unit)
+    tol = 0.03 / unit
+    e1 = np.cross(up, [1.0, 0, 0] if abs(up[0]) < 0.9 else [0, 1.0, 0])
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(up, e1)
+    step = 0.15 / unit
+    shifts = [np.zeros(3), step * e1, -step * e1, step * e2, -step * e2]
+    centre = target.mean(0)
+    trials = []
+    if near:
+        shifts = shifts[:1]
+    for yaw in (range(-30, 31, 15) if near else range(0, 360, 15)):
+        r = _turn(up, math.radians(yaw))
+        for size in ((0.92, 1.0, 1.08) if near else (0.7, 0.85, 1.0, 1.18, 1.4)):
+            q0 = size * (probe - pivot) @ r.T + pivot
+            # also try the scan's middle on the model's middle, for a ghost dragged well off
+            centred = centre - q0.mean(0)
+            centred -= up * (centred @ up)
+            for shift in shifts + [centred]:
+                f = grid.score(q0 + shift)[2]
+                start = np.eye(4)
+                start[:3, :3] = size * r
+                start[:3, 3] = pivot - size * r @ pivot + shift
+                trials.append((f, yaw, size, start))
+    trials.sort(key=lambda x: -x[0])
+    # refine the most promising few on a sample, then the winner on the whole scan; on a near tie
+    # the turn closest to how the person placed the ghost wins (symmetric furniture fits both ways)
+    sample = pick(scan, 2000)
+    best, seen = None, []
+    for _, yaw, size, start in trials:
+        if len(seen) >= 8:
+            break
+        if any(abs((yaw - y + 180) % 360 - 180) < 10 and abs(size / z - 1) < 0.1 for y, z in seen):
+            continue
+        seen.append((yaw, size))
+        moved = sample @ start[:3, :3].T + start[:3, 3]
+        icp = _icp(moved, target, unit / size, True, tree=target_tree, start_gate=0.12, rounds=14, axis=up)[0] @ start
+        aligned = sample @ icp[:3, :3].T + icp[:3, 3]
+        f = _match(pick(aligned, 2000), tree, model, tol)[2]
+        rot = icp[:3, :3]
+        turned = math.degrees(math.atan2(e2 @ rot @ e1, e1 @ rot @ e1))
+        f -= 0.02 * abs(turned) / 180
+        if best is None or f > best[0]:
+            best = (f, icp)
+    _, start = best
+    size = float(np.cbrt(abs(np.linalg.det(start[:3, :3]))))
+    moved = scan @ start[:3, :3].T + start[:3, 3]
+    icp, aligned, rmse, inliers = _icp(moved, target, unit / size, True, tree=target_tree, start_gate=0.05, rounds=10, axis=up)
+    total = icp @ start
+    size = float(np.cbrt(abs(np.linalg.det(total[:3, :3]))))
+    precision, near = _footprint_precision(aligned, target, target_tree, tol, 0.1 / unit)
+    recall = _match(pick(aligned, 4000), tree, model, tol)[1]
+    rot = total[:3, :3] / size
+    yaw = math.degrees(math.atan2(e2 @ rot @ e1, e1 @ rot @ e1))
+    summary = {"precision": round(precision, 3), "recall": round(recall, 3), "near": near,
+               "yaw": round(yaw), "size": round(size, 3)}
+    return total, aligned, rmse, inliers, summary
 
 
 # ---------- the check ----------
@@ -202,86 +359,133 @@ class CheckIn(BaseModel):
     photo: Optional[str] = Field(None, description="base64 JPEG of the furniture")
 
 
+class FitIn(BaseModel):
+    installed: list[int]
+    active: list[int]
+    near: bool = Field(False, description="The ghost already sits about right: only small changes are tried")
+    ghost: list[float] = Field(description="Model-to-world 4x4, column-major, metres, from the ghost placement")
+    points: str = Field(description="base64 float32 x,y,z world points in metres, the scan so far")
+
+
 def _matrix(values):
     if len(values) != 16:
         raise HTTPException(400, "ghost must be 16 numbers")
     return np.asarray(values, dtype=np.float64).reshape(4, 4).T   # column-major in
 
 
-def check(article: str, body: CheckIn) -> dict:
-    kit = get_kit(article)
-    parts, diagonal = _arrays(article)
-    raw = np.frombuffer(base64.b64decode(body.points), dtype="<f4")
-    if raw.size < 300 or raw.size % 3:
+def _thin(part, unit):
+    """Rods, dowels and narrow rails: too thin for the LiDAR scan to judge reliably (metres)."""
+    extent = np.sort(part["hi"] - part["lo"]) * unit
+    return extent[1] < 0.04
+
+
+def _prepare(article, installed, active, ghost, points, min_points=300):
+    """Decodes the scan and finds the floor and the part of the scan around the ghost."""
+    parts, _ = _arrays(article)
+    raw = np.frombuffer(base64.b64decode(points), dtype="<f4")
+    if raw.size < min_points or raw.size % 3:
         raise HTTPException(400, "Too few scanned points. Walk all the way around the furniture and scan again.")
     world = raw.reshape(-1, 3).astype(np.float64)
-
-    ghost_m = _matrix(body.ghost)
+    ghost_m = _matrix(ghost)
     unit = float(np.cbrt(abs(np.linalg.det(ghost_m[:3, :3]))))   # metres per model unit at the ghost's scale
     to_model = np.linalg.inv(ghost_m)
-
-    expected = [p for p in dict.fromkeys(body.installed + body.active) if p in parts]
+    expected = [p for p in dict.fromkeys(installed + active) if p in parts]
     solid = [p for p in expected if not parts[p]["fastener"]]
     if not solid:
         raise HTTPException(400, "This step has no parts large enough to scan.")
     spacing = SPACING / unit
     samples = {p: _samples(article, p, spacing) for p in solid}
-
-    # floor: the ghost stands on the floor, so its lowest point marks it roughly; the scan's own
-    # densest flat layer near there marks it exactly
     target = np.concatenate([samples[p] for p in solid])
     target_world = target @ ghost_m[:3, :3].T + ghost_m[:3, 3]
     floor_y = _floor(world, target_world)
     height = float(target_world[:, 1].max() - target_world[:, 1].min())
-    if height < FLAT:
-        results = [{"id": p, "name": parts[p]["name"], "active": p in body.active, "status": "unsure", "coverage": None,
-                    "message": "Lies too flat on the floor for the 3D scan to tell apart; checked from the photo."}
-                   for p in expected]
-        return {"verdict": "unsure", "summary": "At this step everything lies nearly flat on the floor, so the 3D scan "
-                "can't check it. The photo check below is all there is for this step.",
-                "parts": results, "extras": [], "transform": body.ghost, "fit": {"height_m": round(height, 3)}}
-    above = world[:, 1] > floor_y + FLOOR
-    model_pts = world @ to_model[:3, :3].T + to_model[:3, 3]
-
-    lo = target.min(0) - 0.25 / unit
-    hi = target.max(0) + 0.25 / unit
-    near = above & np.all((model_pts > lo) & (model_pts < hi), axis=1)
-    scan = model_pts[near]
-    if len(scan) < 200:
-        return {"verdict": "unsure", "summary": "The scan did not pick up the furniture under the ghost. "
-                "Line the ghost up with your furniture, then walk slowly all the way around it.",
-                "parts": [], "extras": [], "transform": body.ghost, "fit": {"points": int(len(scan))}}
+    # Keep what is within reach of the ghost in any direction across the floor, so a ghost turned
+    # the wrong way does not cut off part of the furniture (a box around the ghost would)
+    centre = target_world.mean(0)
+    reach = np.linalg.norm(target_world[:, [0, 2]] - centre[[0, 2]], axis=1).max()
+    across = np.linalg.norm(world[:, [0, 2]] - centre[[0, 2]], axis=1)
+    near = (world[:, 1] > floor_y + FLOOR) & (across < 1.5 * reach + 0.3) & (world[:, 1] < floor_y + 2 * height + 0.3)
+    scan = (world @ to_model[:3, :3].T + to_model[:3, 3])[near]
     if len(scan) > 60000:
         scan = scan[np.random.default_rng(0).choice(len(scan), 60000, replace=False)]
+    up = to_model[:3, :3] @ np.array([0.0, 1.0, 0.0])
+    up /= np.linalg.norm(up)
+    pivot = to_model[:3, :3] @ np.array([centre[0], floor_y, centre[2]]) + to_model[:3, 3]
+    return dict(parts=parts, expected=expected, solid=solid, samples=samples, target=target, spacing=spacing,
+                ghost_m=ghost_m, unit=unit, to_model=to_model, floor_y=floor_y, height=height, scan=scan,
+                up=up, pivot=pivot, world_points=len(world))
 
-    # The size is always fitted to the scan, so the model matches the furniture in front of the person
-    # even when it is a different size from the kit's model (or the model has no real size at all)
-    icp, aligned, rmse, inliers = _icp(scan, target, unit, with_scale=True)
-    if inliers < max(100, 0.25 * len(scan)) or not np.isfinite(rmse):
-        # the scan under the ghost does not look like this furniture at all
-        results = [{"id": p, "name": parts[p]["name"], "active": p in body.active, "status": "unsure", "coverage": None,
-                    "message": "Not checked: the scan could not be lined up with the model."} for p in expected]
-        return {"verdict": "unsure", "summary": "The scan doesn't match the shape of the furniture at this step, so the "
-                "parts couldn't be checked. Make sure the ghost sits right over your furniture (tip it over if it's "
-                "lying down), then scan again, walking all the way around.",
-                "parts": results, "extras": [], "transform": body.ghost,
-                "fit": {"points": int(len(scan)), "inliers": inliers}}
+
+GOOD_FIT = 0.75  # share of the scan over the model's footprint that must lie on the model
+GOOD_COVER = 0.3   # and share of the model the scan must cover
+
+
+@router.post("/{article}/fit")
+def live_fit(article: str, body: FitIn):
+    """Where the model sits on the scan so far, so the phone can slide, turn and resize the ghost onto
+    the real furniture while the person walks around it. `transform` is null until the fit is good."""
+    started = time.time()
+    c = _prepare(article, body.installed, body.active, body.ghost, body.points, min_points=150)
+    if len(c["scan"]) < 150 or c["height"] < FLAT:
+        return {"transform": None, "points": len(c["scan"])}
+    icp, _, rmse, inliers, match = _fit(c["scan"], c["target"], c["unit"], c["up"], c["pivot"], near=body.near)
+    good = match["precision"] >= GOOD_FIT and match["recall"] >= GOOD_COVER and inliers >= 100
+    print(f"[stepcheck] live fit {time.time() - started:.1f}s: {len(c['scan'])} pts, {match}, "
+          f"{'moving the ghost' if good else 'not sure yet'}", flush=True)
+    transform = c["ghost_m"] @ np.linalg.inv(icp)
+    return {"transform": transform.T.reshape(-1).tolist() if good else None, **match}
+
+
+def check(article: str, body: CheckIn) -> dict:
+    kit = get_kit(article)
+    c = _prepare(article, body.installed, body.active, body.ghost, body.points)
+    parts, expected, solid, samples, target = c["parts"], c["expected"], c["solid"], c["samples"], c["target"]
+    unit, ghost_m, scan, spacing = c["unit"], c["ghost_m"], c["scan"], c["spacing"]
+
+    def all_unsure(message):
+        return [{"id": p, "name": parts[p]["name"], "active": p in body.active, "status": "unsure", "coverage": None,
+                 "message": message} for p in expected]
+
+    if c["height"] < FLAT:
+        return {"verdict": "unsure", "scan": "flat", "summary": "At this step everything lies nearly flat on the floor, "
+                "so the 3D scan can't check it; the photo check decides.",
+                "parts": all_unsure("Lies too flat on the floor for the 3D scan; checked from the photo."),
+                "extras": [], "transform": body.ghost, "fit": {"height_m": round(c["height"], 3)}}
+    if len(scan) < 200:
+        return {"verdict": "unsure", "scan": "empty", "summary": "The 3D scan barely picked up the furniture, so the "
+                "photo check decides. For a better scan, walk slowly all the way around, about an arm's length away.",
+                "parts": all_unsure("Not checked by the 3D scan; checked from the photo."),
+                "extras": [], "transform": body.ghost, "fit": {"points": int(len(scan))}}
+
+    icp, aligned, rmse, inliers, match = _fit(scan, target, unit, c["up"], c["pivot"])
+    print(f"[stepcheck] best fit: {match['precision']:.0%} of the scan over the model on it, {match['recall']:.0%} of "
+          f"the model scanned, turned {match['yaw']} deg, size x{match['size']:.2f}", flush=True)
+    if match["precision"] < GOOD_FIT or match["recall"] < GOOD_COVER or not np.isfinite(rmse):
+        return {"verdict": "unsure", "scan": "no_fit", "summary": "The 3D scan couldn't be lined up with the model, so "
+                "the photo check decides.",
+                "parts": all_unsure("Not checked by the 3D scan; checked from the photo."), "extras": [],
+                "transform": body.ghost, "fit": {"points": int(len(scan)), "inliers": inliers, **match}}
     scale = float(np.cbrt(abs(np.linalg.det(icp[:3, :3]))))
     unit_after = unit / scale          # metres per model unit after the fit
     transform = ghost_m @ np.linalg.inv(icp)
+    up_fit = icp[:3, :3] @ c["up"]
+    up_fit /= np.linalg.norm(up_fit)
 
-    # which model samples the scan covers, ignoring ones hidden on the floor or inside joints
+    # which model samples the scan covers, ignoring ones under or on the real floor, or inside joints
     labels = np.concatenate([np.full(len(samples[p]), i) for i, p in enumerate(solid)])
     model_tree = cKDTree(target)
-    floor_model = target[:, 1].min()
-    hidden = target[:, 1] < floor_model + 0.02 / unit_after
-    for i, neighbours in enumerate(model_tree.query_ball_point(target, CONTACT / unit_after)):
-        if not hidden[i] and any(labels[j] != labels[i] for j in neighbours):
-            hidden[i] = True
+    rise = target @ up_fit
+    floor_level = float((icp[:3, :3] @ c["pivot"] + icp[:3, 3]) @ up_fit)
+    hidden = rise < floor_level + 0.01 / unit_after
+    for i in range(len(solid)):   # samples touching another part sit in a joint
+        mine, others = labels == i, labels != i
+        if others.any():
+            d, _ = cKDTree(target[others]).query(target[mine], distance_upper_bound=CONTACT / unit_after)
+            hidden[np.flatnonzero(mine)[np.isfinite(d)]] = True
     # Each scan point belongs to the part it lies closest to, later parts included. Otherwise a
     # missing rail would look covered by the scan of the boards it touches.
     future = [p for p in body.future if p in parts and not parts[p]["fastener"] and p not in solid]
-    later =[_samples(article, p, spacing) for p in future]
+    later = [_samples(article, p, spacing) for p in future]
     owners_tree = cKDTree(np.concatenate([target] + later)) if later else model_tree
     owner_labels = np.concatenate([labels] + [np.full(len(s), len(solid) + k) for k, s in enumerate(later)])
     _, nearest_sample = owners_tree.query(aligned)
@@ -310,15 +514,19 @@ def check(article: str, body: CheckIn) -> dict:
             coverage = float(np.isfinite(d).mean())
         else:
             coverage = 0.0
-        results.append({"id": p, "name": parts[p]["name"], "active": p in body.active,
+        results.append({"id": p, "name": parts[p]["name"], "active": p in body.active, "thin": _thin(parts[p], unit_after),
                         "visible_samples": nv, "coverage": round(coverage, 3)})
-    measured = [r["coverage"] for r in results if r["visible_samples"] >= 30]
+    measured = [r["coverage"] for r in results if r["visible_samples"] >= 30 and not r["thin"]] or \
+               [r["coverage"] for r in results if r["visible_samples"] >= 30]
     reference = float(np.median(measured)) if measured else 0.0
     for r in results:
         if r["visible_samples"] < 30:
-            r["status"], r["message"] = "unsure", "Mostly hidden from view, so the scan cannot check it."
+            r["status"], r["message"] = "unsure", "Mostly hidden from the 3D scan; checked from the photo."
         elif r["coverage"] >= max(0.25, 0.45 * reference):
             r["status"], r["message"] = "ok", "In place."
+        elif r["thin"]:
+            # LiDAR often misses rods and dowels that are there, so only the photo may call them missing
+            r["status"], r["message"] = "unsure", "Too thin for the 3D scan to be sure; checked from the photo."
         elif r["coverage"] < max(0.1, 0.3 * reference):   # scan noise lends a missing part some coverage from its neighbours
             r["status"] = "missing"
             r["message"] = ("Nothing was scanned where this part goes. It may be missing, in the wrong place, "
@@ -334,7 +542,7 @@ def check(article: str, body: CheckIn) -> dict:
     # scanned shapes where no part should be yet
     all_lo = np.min([q["lo"] for q in parts.values()], axis=0) - 0.05 / unit_after
     all_hi = np.max([q["hi"] for q in parts.values()], axis=0) + 0.05 / unit_after
-    inside = np.all((aligned > all_lo) & (aligned < all_hi), axis=1) & (aligned[:, 1] > floor_model + 0.02 / unit_after)
+    inside = np.all((aligned > all_lo) & (aligned < all_hi), axis=1) & (aligned @ up_fit > floor_level + 0.02 / unit_after)
     gap, _ = model_tree.query(aligned)
     stray = aligned[inside & (gap > EXTRA / unit_after)]
     extras = _clusters(stray, unit_after)
@@ -356,17 +564,19 @@ def check(article: str, body: CheckIn) -> dict:
                             "a part in the wrong place, or an object close to the furniture.")
 
     missing = [r for r in results if r["status"] == "missing"]
-    verdict = "problems" if missing or extras else "unsure" if reference < 0.2 else "ok"
+    thin_unsure = any(r["status"] == "unsure" and r.get("thin") for r in results)
+    verdict = "problems" if missing or extras else "unsure" if reference < 0.2 or thin_unsure else "ok"
     # how the real furniture compares with the kit model (only meaningful when the model has a real size)
     known = metres_per_unit(kit)
     resized = unit_after / known if known else None
     return {
         "verdict": verdict,
+        "scan": "fitted",
         "missing": plain_list(r["name"] for r in missing),
         "resized": round(resized, 3) if resized and abs(resized - 1) > 0.05 else None,
         "transform": transform.T.reshape(-1).tolist(),   # column-major, model units -> world metres
         "fit": {"rmse_mm": round(rmse * 1000, 1), "inliers": inliers, "points": int(len(scan)),
-                "scale": round(scale, 4), "coverage": round(reference, 3)},
+                "scale": round(scale, 4), "coverage": round(reference, 3), **match},
         "parts": results,
         "extras": extras,
     }
@@ -379,10 +589,10 @@ def _floor(world, ghost_world):
     rough = float(ghost_world[:, 1].min())
     lo, hi = ghost_world[:, [0, 2]].min(0) - 0.5, ghost_world[:, [0, 2]].max(0) + 0.5
     near = world[np.all((world[:, [0, 2]] > lo) & (world[:, [0, 2]] < hi), axis=1)]
-    ys = near[(near[:, 1] > rough - 0.08) & (near[:, 1] < rough + 0.03), 1]
+    ys = near[(near[:, 1] > rough - 0.1) & (near[:, 1] < rough + 0.1), 1]
     if len(ys) < 200:
         return rough
-    counts, edges = np.histogram(ys, bins=np.arange(rough - 0.08, rough + 0.0301, 0.005))
+    counts, edges = np.histogram(ys, bins=np.arange(rough - 0.1, rough + 0.1001, 0.005))
     dense = np.flatnonzero(counts >= 0.3 * counts.max())
     first = int(dense[0])
     return float((edges[first] + edges[first + 1]) / 2)
@@ -479,20 +689,46 @@ def advice(body: CheckIn, results: list[dict]) -> Optional[dict]:
                 "tips": [], "error": f"{type(error).__name__}: {str(error)[:200]}"}
 
 
+def combine(result: dict):
+    """One answer from both checks. LiDAR judges the big boards; the photo judges thin parts (rods,
+    dowels) and hardware, and decides on its own when the 3D scan could not be used."""
+    photo = result.get("advice")
+    seen = bool(photo) and "missing" in photo     # the photo check ran
+    photo_missing = photo.get("missing", []) if seen else []
+    scan_missing = result.get("missing") or []
+    result["missing"] = photo_missing if seen else scan_missing
+    screws_bad = bool(photo) and photo.get("screws") == "problem"
+    if seen and not photo_missing:
+        # the photo shows nothing missing: thin parts the scan was unsure about are there
+        for r in result["parts"]:
+            if r["status"] == "unsure" and (r.get("thin") or result.get("scan") != "fitted"):
+                r["status"], r["message"] = "ok", "Seen in place in the photo."
+    if scan_missing and seen:
+        # a board the scan found missing stays on the list even if the photo did not mention it
+        listed = " ".join(photo_missing).lower()
+        result["missing"] += [m for m in scan_missing if m.split(" x ")[-1] not in listed]
+    if result["missing"] or screws_bad or result.get("extras"):
+        result["verdict"] = "problems"
+    elif result["verdict"] == "ok" or (seen and result["verdict"] == "unsure"):
+        result["verdict"] = "ok"
+    if result["verdict"] == "ok":
+        result["summary"] = None   # the scan's own caveats do not matter once everything checks out
+
+
 @router.post("/{article}")
 def check_step(article: str, body: CheckIn):
     started = time.time()
+    try:   # every real scan is kept so a bad result can be replayed and fixed (server/jobs is not committed)
+        SAVED.mkdir(parents=True, exist_ok=True)
+        (SAVED / f"{time.strftime('%Y%m%d-%H%M%S')}-{article}-step{body.step}.json").write_text(body.model_dump_json())
+    except OSError:
+        pass
     print(f"[stepcheck] {article} step {body.step}: {len(body.points) * 3 // 4 // 12} points, "
           f"photo {'yes' if body.photo else 'no'}", flush=True)
     result = check(article, body)
     print(f"[stepcheck] scan compared in {time.time() - started:.1f}s: {result['verdict']}, fit {result.get('fit')}", flush=True)
     result["advice"] = advice(body, result["parts"]) if result["parts"] else None
-    # Gemini's plain names win; the scan's own list stands when the photo check is unavailable
-    if result["advice"] and "missing" in result["advice"]:
-        result["missing"] = result["advice"]["missing"]
-    result.setdefault("missing", [])
-    print(f"[stepcheck] missing: {result['missing']}", flush=True)
+    combine(result)
+    print(f"[stepcheck] {result['verdict']}, missing: {result['missing']}", flush=True)
     print(f"[stepcheck] done in {time.time() - started:.1f}s", flush=True)
-    if result["advice"] and result["advice"].get("screws") == "problem" and result["verdict"] == "ok":
-        result["verdict"] = "problems"
     return result

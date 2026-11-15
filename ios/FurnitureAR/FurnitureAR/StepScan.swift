@@ -130,6 +130,41 @@ enum StepCheckAPI {
         return try JSONDecoder().decode(CheckResult.self, from: data)
     }
 
+    struct LiveFit: Decodable {
+        let transform: [Float]?   // null until the scan so far fits the model well
+        let size: Float?
+        let precision: Float?
+        let recall: Float?
+    }
+
+    private struct FitBody: Encodable {
+        let installed: [Int]
+        let active: [Int]
+        let near: Bool
+        let ghost: [Float]
+        let points: String
+    }
+
+    /// Where the model sits on the scan so far, so the ghost can move onto the real furniture.
+    static func fit(server: String, request: ScanRequest, ghost: simd_float4x4, points: [SIMD3<Float>], near: Bool) async throws -> LiveFit {
+        var flat = [Float]()
+        flat.reserveCapacity(points.count * 3)
+        for p in points { flat.append(p.x); flat.append(p.y); flat.append(p.z) }
+        let columns = [ghost.columns.0, ghost.columns.1, ghost.columns.2, ghost.columns.3]
+        let body = FitBody(installed: request.installed, active: request.active, near: near,
+                           ghost: columns.flatMap { [$0.x, $0.y, $0.z, $0.w] },
+                           points: flat.withUnsafeBufferPointer { Data(buffer: $0) }.base64EncodedString())
+        let path = "/api/stepcheck/\(request.kit.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? request.kit)/fit"
+        guard let url = URL(string: server + path) else { throw Failure(message: "Bad server address") }
+        var http = URLRequest(url: url, timeoutInterval: 20)
+        http.httpMethod = "POST"
+        http.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        http.httpBody = try JSONEncoder().encode(body)
+        let (data, response) = try await session.data(for: http)
+        try check(response, data)
+        return try JSONDecoder().decode(LiveFit.self, from: data)
+    }
+
     private static func check(_ response: URLResponse, _ data: Data) throws {
         guard let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) else { return }
         let detail = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["detail"] as? String
