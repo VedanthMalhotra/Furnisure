@@ -7,7 +7,7 @@ const $ = id => document.getElementById(id);
 const camera = new THREE.PerspectiveCamera(40,1,.001,100);
 const views = ['left','right'].map(id => {
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0xefebe4);
+  scene.background = new THREE.Color(0xe8ede2);
   scene.add(new THREE.HemisphereLight(0xffffff,0x717971,2));
   const light = new THREE.DirectionalLight(0xffffff,2);
   light.position.set(2,4,3);
@@ -494,27 +494,33 @@ async function perform(work) {
   finally { busy = false; updateControls(); }
 }
 
+async function readManual(pdf, fresh = false) {
+  status('Reading the PDF and preparing the walkthrough…');
+  const body = new FormData();
+  body.append('file', pdf, pdf.name || 'manual.pdf');
+  const response = await fetch(`/api/kits/scan?fresh=${fresh}`, {method:'POST', body});
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.detail);
+  await load(result.kit);
+  await addHardware(result.plan.hardware);
+  setPlan(result.plan, pdf);
+  status(kit.name + ' · ' + kit.manual_id + ' · Review the parts and illustrative motion before export.');
+}
+
+function setPlan(plan, pdf) {
+  if (sourceUrl) URL.revokeObjectURL(sourceUrl);
+  sourceUrl = URL.createObjectURL(pdf);
+  actions = plan.actions;
+  $('review').checked = false;
+  $('issues').textContent = plan.unresolved.join('\n');
+  $('issues').hidden = !plan.unresolved.length;
+  showStep(0);
+}
+
 $('scan').onsubmit = event => {
   event.preventDefault();
-  perform(async () => {
-    status('Reading the PDF and matching its kit…');
-    const file = $('pdf').files[0];
-    const body = new FormData();
-    body.append('file',file);
-    const response = await fetch('/api/kits/scan',{method:'POST',body});
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.detail);
-    await load(result.kit);
-    await addHardware(result.plan.hardware);
-    if (sourceUrl) URL.revokeObjectURL(sourceUrl);
-    sourceUrl = URL.createObjectURL(file);
-    actions = result.plan.actions;
-    $('review').checked = false;
-    $('issues').textContent = result.plan.unresolved.join('\n');
-    $('issues').hidden = !result.plan.unresolved.length;
-    showStep(0);
-    status(kit.name + ' · ' + kit.manual_id + ' · Review the parts and illustrative motion before export.');
-  });
+  const file = $('pdf').files[0];
+  if (file) perform(() => readManual(file));
 };
 $('kit').onchange = () => perform(async () => {
   await load(catalog.find(item => item.article_number === $('kit').value));
@@ -663,26 +669,35 @@ perform(async () => {
   if (!response.ok) throw new Error('Could not load the kit catalog.');
   catalog = await response.json();
   for (const item of catalog) $('kit').add(new Option(item.name+' · '+item.article_number,item.article_number));
-  const requested = new URLSearchParams(location.search).get('kit');
+  const params = new URLSearchParams(location.search);
+  const requested = params.get('kit');
   const selected = catalog.find(item => item.article_number === requested);
   await load(selected || catalog[0]);
   if (selected) {
-    const auto = new URLSearchParams(location.search).has('auto');
-    const response = await fetch('/api/kits/' + encodeURIComponent(selected.article_number) + '/reference-plan' + (auto ? '?auto=true' : ''));
-    if (response.ok) {
-      const result = await response.json();
-      actions = result.plan.actions;
-      const manual = await fetch('/api/kits/' + encodeURIComponent(selected.article_number) + '/manual');
+    const auto = params.has('auto');
+    const read = params.has('read');
+    const fresh = read && params.has('fresh');
+    const kitUrl = '/api/kits/' + encodeURIComponent(selected.article_number);
+    const reference = fresh ? null : await fetch(kitUrl + '/reference-plan' + (auto ? '?auto=true' : ''));
+    if (reference && !reference.ok && reference.status !== 404) {
+      throw new Error('Could not load the annotated steps for this model.');
+    }
+    if (reference?.ok || read) {
+      const manual = await fetch(kitUrl + '/manual');
       if (!manual.ok) throw new Error('Could not load the matching manual.');
-      sourceUrl = URL.createObjectURL(await manual.blob());
-      $('issues').textContent = result.plan.unresolved.join('\n');
-      $('issues').hidden = !result.plan.unresolved.length;
-      showStep(0);
+      const pdf = await manual.blob();
+      if (!reference?.ok) {
+        // Home's match uses the PDF hash, so these are the exact bytes the user selected.
+        await readManual(pdf, fresh);
+        return;
+      }
+      const result = await reference.json();
+      setPlan(result.plan, pdf);
       if (selected.checked_plan && auto) status('Saved BEKVÄM steps with motion computed from the 3D model.');
       else if (selected.checked_plan) status('Saved BEKVÄM walkthrough with individual rail, dowel, and screw actions.');
       else status('Using dataset assembly annotations. Step numbers are dataset stages; compare the displayed manual. Motion is illustrative.');
-    } else if (response.status === 404) {
+    } else {
       status('Model loaded. Upload the matching PDF to generate steps with Gemini.');
-    } else throw new Error('Could not load the annotated steps for this model.');
+    }
   } else status('Kit loaded. Upload the matching PDF to generate steps.');
 });

@@ -22,32 +22,35 @@ fetch('/api/health').then(r => r.json()).then(h => {
 });
 $('files').onchange = () => {
   const n = $('files').files.length;
-  $('fileLabel').textContent = !n ? 'Choose a PDF or take photos' : n === 1 ? $('files').files[0].name : `${n} pages selected`;
-  $('fileHint').textContent = n ? 'Tap to choose different files' : 'or drop it here · parts list first, then the steps in order';
+  $('fileLabel').textContent = !n ? 'Upload manual' : n === 1 ? $('files').files[0].name : `${n} pages selected`;
+  $('fileHint').textContent = n ? 'Tap to choose different files' : 'PDF or photos in page order';
   $('drop').classList.toggle('has', n > 0);
-  $('go').disabled = !n;
+  $('go').hidden = $('go').disabled = !n;
 };
 $('go').onclick = async () => {
-  if ($('files').files.length === 1) {
+  const files = [...$('files').files];
+  const fresh = $('fresh').checked;
+  $('scanErr').textContent = '';
+  if (files.length === 1) {
     const match = new FormData();
-    match.append('file', $('files').files[0]);
+    match.append('file', files[0]);
     try {
       const response = await fetch('/api/kits/match', { method: 'POST', body: match });
       if (!response.ok) throw new Error('Could not check the kit catalog.');
       const result = await response.json();
       if (result.article_number) {
-        location.href = `/kits.html?kit=${encodeURIComponent(result.article_number)}`;
+        const params = new URLSearchParams({ kit: result.article_number, read: '1' });
+        if (fresh) params.set('fresh', '1');
+        location.href = `/kits.html?${params}`;
         return;
       }
     } catch (error) { $('scanErr').textContent = error.message; return; }
   }
   const fd = new FormData();
-  for (const f of $('files').files) fd.append('files', f);
-  startJob(fetch(`/api/jobs?fresh=${$('fresh').checked}`, { method: 'POST', body: fd }));
+  for (const file of files) fd.append('files', file);
+  startJob(fetch(`/api/jobs?fresh=${fresh}`, { method: 'POST', body: fd }));
 };
-$('sample').onclick = () => startJob(fetch(`/api/sample?fresh=${$('fresh').checked}`, { method: 'POST' }));
 $('back1').onclick = () => { location.hash = ''; show('scan'); };
-$('newScan').onclick = () => { location.hash = ''; location.reload(); };
 
 async function startJob(req) {
   $('scanErr').textContent = '';
@@ -89,7 +92,7 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
 renderer.shadowMap.enabled = true;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 const scene = new THREE.Scene();
-const BG = new THREE.Color(0xf4f1ec), WHITE = new THREE.Color(0xffffff);
+const BG = new THREE.Color(0xf5f7ef), WHITE = new THREE.Color(0xffffff);
 scene.background = BG;
 const envMap = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
 scene.environment = envMap;
