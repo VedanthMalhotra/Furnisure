@@ -14,7 +14,7 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;',
 
 // ===================== Scan + progress =====================
 fetch('/api/health').then(r => r.json()).then(h => {
-  $('health').textContent = `Ready · ${h.model}`;
+  $('health').textContent = 'Ready';
   $('health').classList.add('ok');
 }).catch(() => {
   $('health').textContent = 'Server not reachable';
